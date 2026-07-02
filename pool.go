@@ -5,9 +5,9 @@ import (
 	"sync"
 )
 
-// Adapted from https://github.com/golang/go/issues/27735#issuecomment-739169121
-
-var errAttached = errors.New("buffer is already attached")
+// ErrAttached is returned by Pool.Attach when the buffer is already attached
+// to a pool.
+var ErrAttached = errors.New("buffer is already attached")
 
 // Pool is a pool of reusable byte buffers, backed by a sync.Pool. The zero
 // value is not usable; create one with New. A Pool is safe for concurrent use
@@ -18,34 +18,32 @@ type Pool struct {
 
 // New creates a new, empty buffer pool.
 func New() *Pool {
-	return &Pool{pool: sync.Pool{New: func() interface{} { return new(poolStorage) }}}
+	return &Pool{pool: sync.Pool{New: func() any { return new(poolStorage) }}}
 }
 
-// Get returns a Buffer drawn from the pool along with its (empty) backing
-// slice. The buffer is attached to p, so calling Recycle or Close on it puts it
-// back into the pool. The returned slice is the buffer's current contents and
-// has length zero; it is returned as a convenience and may be ignored.
-func (p *Pool) Get() (*Buffer, []byte) {
+// Get returns an empty Buffer drawn from the pool. The buffer is attached to
+// p, so calling Recycle or Close on it puts it back into the pool.
+func (p *Pool) Get() *Buffer {
 	storage := p.pool.Get().(*poolStorage)
-	result := &Buffer{poolStorage: *storage, pool: p}
+	result := &Buffer{poolStorage: *storage, storage: storage, pool: p}
 	result.buf = result.buf[:0]
-	return result, result.buf
+	return result
 }
 
-// GetFrom returns a Buffer pre-filled with a copy of data, along with its
-// backing slice. The data is copied, so the caller may reuse or modify data
-// afterwards. Like Get, the returned buffer is attached to p.
-func (p *Pool) GetFrom(data []byte) (*Buffer, []byte) {
-	buf, _ := p.Get()
+// GetFrom returns a Buffer pre-filled with a copy of data. The data is copied,
+// so the caller may reuse or modify data afterwards. Like Get, the returned
+// buffer is attached to p.
+func (p *Pool) GetFrom(data []byte) *Buffer {
+	buf := p.Get()
 	_, _ = buf.Write(data)
-	return buf, buf.buf
+	return buf
 }
 
 // Attach attaches a detached buffer to the pool so that a later Recycle or Close
-// recycles it into p. It returns an error if b is already attached to a pool.
+// recycles it into p. It returns ErrAttached if b is already attached to a pool.
 func (p *Pool) Attach(b *Buffer) error {
 	if b.pool != nil {
-		return errAttached
+		return ErrAttached
 	}
 	b.pool = p
 	return nil
@@ -71,11 +69,10 @@ func (b *poolStorage) recycle() bool {
 	return true
 }
 
-func (p *Pool) put(b *poolStorage) int {
+func (p *Pool) put(b *poolStorage) {
 	if b.recycle() {
 		p.pool.Put(b)
 	}
-	return b.strikes
 }
 
 type poolStorage struct {

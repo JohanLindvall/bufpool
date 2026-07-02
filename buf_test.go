@@ -2,6 +2,7 @@ package bufpool
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 
@@ -10,7 +11,7 @@ import (
 
 func Test_unit_SetBytes(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	buf.SetBytes([]byte("test"))
 	assert.Equal(t, []byte("test"), buf.buf)
 }
@@ -27,14 +28,14 @@ func Test_unit_Bytes_Read(t *testing.T) {
 
 func Test_unit_Detach(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	buf.Detach()
 	assert.Nil(t, buf.pool)
 }
 
 func Test_unit_Write(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	n, err := buf.Write([]byte("test"))
 	assert.Nil(t, err)
 	assert.Equal(t, 4, n)
@@ -52,7 +53,7 @@ func (n *nullWriter) Write(p []byte) (int, error) {
 
 func Test_unit_WriteTo(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	_, _ = buf.Write([]byte("test"))
 	dest := bytes.NewBuffer(nil)
 	n, err := buf.WriteTo(dest)
@@ -61,38 +62,131 @@ func Test_unit_WriteTo(t *testing.T) {
 	assert.Equal(t, []byte("test"), dest.Bytes())
 }
 
-func Test_unit_WriteTo_Skip(t *testing.T) {
+func Test_unit_WriteTo_ShortWrite(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	_, _ = buf.Write([]byte("test"))
-	_, _ = buf.WriteTo(&nullWriter{n: 1, err: nil})
+	n, err := buf.WriteTo(&nullWriter{n: 1, err: nil})
+	assert.ErrorIs(t, err, io.ErrShortWrite)
+	assert.Equal(t, int64(1), n)
+	// The accepted byte is consumed; the rest remains readable.
 	dest := bytes.NewBuffer(nil)
-	n, err := buf.WriteTo(dest)
+	n, err = buf.WriteTo(dest)
 	assert.Nil(t, err)
 	assert.Equal(t, int64(3), n)
 	assert.Equal(t, []byte("est"), dest.Bytes())
 }
 
+func Test_unit_WriteTo_Error(t *testing.T) {
+	p := New()
+	buf := p.Get()
+	_, _ = buf.Write([]byte("test"))
+	// A writer error is propagated, and the accepted bytes are still consumed.
+	wantErr := errors.New("boom")
+	n, err := buf.WriteTo(&nullWriter{n: 1, err: wantErr})
+	assert.ErrorIs(t, err, wantErr)
+	assert.Equal(t, int64(1), n)
+	assert.Equal(t, []byte("est"), buf.Bytes())
+}
+
+func Test_unit_WriteTo_Empty(t *testing.T) {
+	p := New()
+	buf := p.GetFrom([]byte("x"))
+	_, _ = io.Copy(io.Discard, buf)
+	// A drained buffer must not call the writer at all.
+	n, err := buf.WriteTo(&nullWriter{err: errors.New("should not be called")})
+	assert.Nil(t, err)
+	assert.Equal(t, int64(0), n)
+}
+
 func Test_unit_Len(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	_, _ = buf.Write([]byte("test"))
-	n := buf.Len()
-	assert.Equal(t, 4, n)
+	assert.Equal(t, 4, buf.Len())
+	assert.Equal(t, 4, buf.Size())
+	// Len counts unread bytes only; Size counts everything written.
+	_, _ = buf.Read(make([]byte, 3))
+	assert.Equal(t, 1, buf.Len())
+	assert.Equal(t, 4, buf.Size())
 }
 
 func Test_unit_Len_Pooled(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	_, _ = buf.Write([]byte("test"))
 	buf.Recycle()
-	n := buf.Len()
-	assert.Equal(t, 0, n)
+	assert.Equal(t, 0, buf.Len())
+	assert.Equal(t, 0, buf.Size())
+}
+
+func Test_unit_Grow(t *testing.T) {
+	buf := NewBuffer(nil)
+	buf.Grow(100)
+	assert.Equal(t, 0, buf.Len())
+	assert.GreaterOrEqual(t, cap(buf.buf), 100)
+	// Writing within the grown capacity must not reallocate.
+	c := cap(buf.buf)
+	_, _ = buf.Write(make([]byte, 100))
+	assert.Equal(t, c, cap(buf.buf))
+}
+
+func Test_unit_Grow_Negative(t *testing.T) {
+	buf := NewBuffer(nil)
+	assert.Panics(t, func() { buf.Grow(-1) })
+}
+
+func Test_unit_Grow_SufficientCapacity(t *testing.T) {
+	// Growing within existing spare capacity is a no-op that keeps the
+	// backing array.
+	buf := NewBuffer(make([]byte, 0, 128))
+	c := cap(buf.buf)
+	buf.Grow(100)
+	assert.Equal(t, c, cap(buf.buf))
+}
+
+func Test_unit_Grow_PreservesContents(t *testing.T) {
+	buf := NewBuffer(nil)
+	_, _ = buf.WriteString("abc")
+	_, _ = buf.Read(make([]byte, 1))
+	buf.Grow(1 << 10)
+	assert.Equal(t, []byte("bc"), buf.Bytes()) // contents and read position survive
+	assert.Equal(t, 3, buf.Size())
+}
+
+func Test_unit_Recycle_Detached(t *testing.T) {
+	// Recycle on a detached buffer is a no-op; the buffer stays usable.
+	buf := NewBuffer(nil)
+	_, _ = buf.WriteString("test")
+	buf.Recycle()
+	assert.Equal(t, []byte("test"), buf.Bytes())
+}
+
+func Test_unit_Recycle_Attached(t *testing.T) {
+	// A buffer that joined the pool via Attach (never via Get) has no pooled
+	// storage yet; Recycle must still hand it to the pool and zero the buffer.
+	p := New()
+	buf := NewBuffer(nil)
+	_ = p.Attach(buf)
+	_, _ = buf.WriteString("test")
+	buf.Recycle()
+	assert.Nil(t, buf.pool)
+	assert.Equal(t, 0, buf.Size())
+	got := p.Get()
+	assert.Equal(t, 0, got.Len())
+}
+
+func Test_unit_Recycle_Twice(t *testing.T) {
+	// A second Recycle is a safe no-op because the first one detaches.
+	p := New()
+	buf := p.Get()
+	buf.Recycle()
+	assert.NotPanics(t, func() { buf.Recycle() })
 }
 
 func Test_unit_Close(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	err := buf.Close()
 	assert.Nil(t, err)
 	assert.Nil(t, buf.pool)
@@ -100,7 +194,7 @@ func Test_unit_Close(t *testing.T) {
 
 func Test_unit_Read(t *testing.T) {
 	p := New()
-	buf, _ := p.GetFrom([]byte("test"))
+	buf := p.GetFrom([]byte("test"))
 	data, err := io.ReadAll(buf)
 	assert.Nil(t, err)
 	assert.Equal(t, []byte("test"), data)
@@ -108,7 +202,7 @@ func Test_unit_Read(t *testing.T) {
 
 func Test_unit_ReadShort(t *testing.T) {
 	p := New()
-	buf, _ := p.GetFrom([]byte("test"))
+	buf := p.GetFrom([]byte("test"))
 	data := []byte{0, 0}
 	n, err := buf.Read(data)
 	assert.Nil(t, err)
@@ -120,7 +214,7 @@ func Test_unit_ReadShort(t *testing.T) {
 
 func Test_unit_ReadShortTwice(t *testing.T) {
 	p := New()
-	buf, _ := p.GetFrom([]byte("test"))
+	buf := p.GetFrom([]byte("test"))
 	data := []byte{0, 0}
 	_, _ = buf.Read(data)
 	n, err := buf.Read(data)
@@ -133,7 +227,7 @@ func Test_unit_ReadShortTwice(t *testing.T) {
 
 func Test_unit_ReadShortThreeTimes(t *testing.T) {
 	p := New()
-	buf, _ := p.GetFrom([]byte("test"))
+	buf := p.GetFrom([]byte("test"))
 	data := []byte{0, 0}
 	_, _ = buf.Read(data)
 	_, _ = buf.Read(data)
@@ -144,7 +238,7 @@ func Test_unit_ReadShortThreeTimes(t *testing.T) {
 }
 
 func Test_unit_ReadAllBytes_Buffer(t *testing.T) {
-	buf := NewBuffer()
+	buf := NewBuffer(nil)
 	_, _ = buf.Write([]byte("test"))
 	data, err := ReadAllBytes(buf)
 	assert.Nil(t, err)
@@ -152,7 +246,7 @@ func Test_unit_ReadAllBytes_Buffer(t *testing.T) {
 }
 
 func Test_unit_ReadAllBytesTwice_Buffer(t *testing.T) {
-	buf := NewBuffer()
+	buf := NewBuffer(nil)
 	_, _ = buf.Write([]byte("test"))
 	_, _ = ReadAllBytes(buf)
 	data, err := ReadAllBytes(buf)
@@ -179,7 +273,7 @@ func Test_unit_ReadAllBytesTwice_Generic(t *testing.T) {
 
 func Test_unit_Rewind(t *testing.T) {
 	p := New()
-	buf, _ := p.Get()
+	buf := p.Get()
 	_, _ = buf.Write([]byte("test"))
 	_, _ = io.Copy(io.Discard, buf)
 	buf.Rewind()

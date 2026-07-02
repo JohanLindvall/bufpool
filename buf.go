@@ -1,7 +1,6 @@
 package bufpool
 
 import (
-	"bytes"
 	"io"
 )
 
@@ -9,16 +8,21 @@ import (
 // io.Reader, io.Writer, io.StringWriter, io.WriterTo and io.Closer. Writes
 // append to the buffer; reads consume it from the front, tracked by an internal
 // read position. The zero value is a usable, detached buffer.
+//
+// A Buffer must not be copied by value after first use, and must not be used
+// after Recycle or Close.
 type Buffer struct {
 	poolStorage
 	readPos int
 	pool    *Pool
+	storage *poolStorage // pooled object, reused on Recycle; nil if never pooled
 }
 
-// NewBuffer creates a new detached buffer whose initial contents are in. The
-// passed bytes become the buffer's backing array; they are not copied.
-func NewBuffer(in ...byte) *Buffer {
-	return &Buffer{poolStorage: poolStorage{buf: in}}
+// NewBuffer creates a new detached buffer whose initial contents are data. The
+// slice becomes the buffer's backing array; it is not copied. NewBuffer(nil)
+// creates an empty buffer.
+func NewBuffer(data []byte) *Buffer {
+	return &Buffer{poolStorage: poolStorage{buf: data}}
 }
 
 // Detach detaches the buffer from its pool. After Detach, Recycle and Close no
@@ -44,24 +48,46 @@ func (b *Buffer) Bytes() []byte {
 
 // Recycle returns the buffer to its pool and resets it to the zero value, so
 // the buffer must not be used after a successful Recycle. If the buffer is
-// detached, Recycle is a no-op and returns 0. The returned int is the buffer's
-// resulting strike count, the number of consecutive times its oversized backing
-// array has been kept despite being under-utilized (see the recycle heuristic);
-// it is mainly useful for tests and tuning.
-func (b *Buffer) Recycle() int {
-	strikes := 0
-	if b.pool != nil {
-		copy := b.poolStorage
-		strikes = b.pool.put(&copy)
-		*b = Buffer{}
+// detached, Recycle is a no-op.
+func (b *Buffer) Recycle() {
+	if b.pool == nil {
+		return
 	}
-	return strikes
+	storage := b.storage
+	if storage == nil {
+		storage = new(poolStorage)
+	}
+	*storage = b.poolStorage
+	b.pool.put(storage)
+	*b = Buffer{}
 }
 
-// Len returns the total length of the buffer, including any portion already
-// consumed by Read. Use len(b.Bytes()) for the number of unread bytes.
+// Len returns the number of unread bytes in the buffer, matching the semantics
+// of bytes.Buffer.Len. Use Size for the total written length.
 func (b *Buffer) Len() int {
+	return len(b.buf) - b.readPos
+}
+
+// Size returns the total length of the buffer, including any portion already
+// consumed by Read.
+func (b *Buffer) Size() int {
 	return len(b.buf)
+}
+
+// Grow grows the buffer's capacity, if necessary, to guarantee space for
+// another n bytes: after Grow(n), at least n bytes can be written without
+// another allocation. Grow panics if n is negative.
+func (b *Buffer) Grow(n int) {
+	if n < 0 {
+		panic("bufpool.Buffer.Grow: negative count")
+	}
+	if cap(b.buf)-len(b.buf) >= n {
+		return
+	}
+	buf := make([]byte, len(b.buf), len(b.buf)+n)
+	copy(buf, b.buf)
+	b.strikes = 0
+	b.buf = buf
 }
 
 // Close returns the buffer to its pool and always returns a nil error. It
@@ -74,28 +100,30 @@ func (b *Buffer) Close() error {
 // Read consumes up to len(p) unread bytes into p, advancing the read position.
 // It returns io.EOF once the buffer is fully consumed. Read implements
 // io.Reader.
-func (b *Buffer) Read(p []byte) (n int, err error) {
-	n = len(b.buf) - b.readPos
-	if n == 0 {
+func (b *Buffer) Read(p []byte) (int, error) {
+	if b.readPos == len(b.buf) {
 		return 0, io.EOF
 	}
-	if n > len(p) {
-		n = len(p)
-	}
-	copy(p, b.buf[b.readPos:n+b.readPos])
+	n := copy(p, b.buf[b.readPos:])
 	b.readPos += n
 	return n, nil
 }
 
 // WriteTo writes the unread portion of the buffer to w, advancing the read
-// position by the number of bytes accepted by w. WriteTo implements
-// io.WriterTo.
-func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
-	var nn int
-	nn, err = w.Write(b.buf[b.readPos:])
+// position by the number of bytes accepted by w. If w accepts fewer bytes than
+// offered without returning an error, WriteTo returns io.ErrShortWrite.
+// WriteTo implements io.WriterTo.
+func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
+	unread := b.buf[b.readPos:]
+	if len(unread) == 0 {
+		return 0, nil
+	}
+	nn, err := w.Write(unread)
 	b.readPos += nn
-	n = int64(nn)
-	return
+	if err == nil && nn < len(unread) {
+		err = io.ErrShortWrite
+	}
+	return int64(nn), err
 }
 
 // Write appends p to the buffer, growing the backing array as needed. It always
@@ -145,15 +173,13 @@ func (b *Buffer) Reset() {
 
 // ReadAllBytes reads all remaining bytes from r. If r is a *Buffer, it returns
 // the buffer's unread bytes directly without copying (aliasing the backing
-// array) and advances the buffer to EOF; otherwise it falls back to copying via
-// io.Copy. The error is nil on success, mirroring io.ReadAll.
+// array) and advances the buffer to EOF; otherwise it falls back to io.ReadAll.
+// The error is nil on success, mirroring io.ReadAll.
 func ReadAllBytes(r io.Reader) ([]byte, error) {
 	if bg, ok := r.(*Buffer); ok {
 		result := bg.buf[bg.readPos:]
 		bg.readPos = len(bg.buf)
 		return result, nil
 	}
-	data := bytes.NewBuffer(nil)
-	_, err := io.Copy(data, r)
-	return data.Bytes(), err
+	return io.ReadAll(r)
 }
