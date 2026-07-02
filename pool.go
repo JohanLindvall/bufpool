@@ -22,7 +22,7 @@ func New() *Pool {
 }
 
 // Get returns a Buffer drawn from the pool along with its (empty) backing
-// slice. The buffer is attached to p, so calling Return or Close on it puts it
+// slice. The buffer is attached to p, so calling Recycle or Close on it puts it
 // back into the pool. The returned slice is the buffer's current contents and
 // has length zero; it is returned as a convenience and may be ignored.
 func (p *Pool) Get() (*Buffer, []byte) {
@@ -41,7 +41,7 @@ func (p *Pool) GetFrom(data []byte) (*Buffer, []byte) {
 	return buf, buf.buf
 }
 
-// Attach attaches a detached buffer to the pool so that a later Return or Close
+// Attach attaches a detached buffer to the pool so that a later Recycle or Close
 // recycles it into p. It returns an error if b is already attached to a pool.
 func (p *Pool) Attach(b *Buffer) error {
 	if b.pool != nil {

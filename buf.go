@@ -21,7 +21,7 @@ func NewBuffer(in ...byte) *Buffer {
 	return &Buffer{poolStorage: poolStorage{buf: in}}
 }
 
-// Detach detaches the buffer from its pool. After Detach, Return and Close no
+// Detach detaches the buffer from its pool. After Detach, Recycle and Close no
 // longer recycle the buffer; it can be re-attached with Pool.Attach.
 func (b *Buffer) Detach() {
 	b.pool = nil
@@ -42,13 +42,13 @@ func (b *Buffer) Bytes() []byte {
 	return b.buf[b.readPos:]
 }
 
-// Return recycles the buffer into its pool and resets it to the zero value, so
-// the buffer must not be used after a successful Return. If the buffer is
-// detached, Return is a no-op and returns 0. The returned int is the buffer's
+// Recycle returns the buffer to its pool and resets it to the zero value, so
+// the buffer must not be used after a successful Recycle. If the buffer is
+// detached, Recycle is a no-op and returns 0. The returned int is the buffer's
 // resulting strike count, the number of consecutive times its oversized backing
 // array has been kept despite being under-utilized (see the recycle heuristic);
 // it is mainly useful for tests and tuning.
-func (b *Buffer) Return() int {
+func (b *Buffer) Recycle() int {
 	strikes := 0
 	if b.pool != nil {
 		copy := b.poolStorage
@@ -65,9 +65,9 @@ func (b *Buffer) Len() int {
 }
 
 // Close returns the buffer to its pool and always returns a nil error. It
-// implements io.Closer and is equivalent to Return.
+// implements io.Closer and is equivalent to Recycle.
 func (b *Buffer) Close() error {
-	b.Return()
+	b.Recycle()
 	return nil
 }
 
@@ -129,10 +129,10 @@ func (b *Buffer) Rewind() {
 }
 
 // Reset rewinds the read position and truncates the buffer for in-place reuse,
-// applying the same recycle heuristic the pool uses on Return: an oversized,
+// applying the same recycle heuristic the pool uses on Recycle: an oversized,
 // repeatedly under-utilized backing array is dropped (replaced with a fresh nil
 // buffer) instead of kept, so a single large use does not pin memory across
-// resets. Unlike Return, the buffer stays usable and attached to its pool.
+// resets. Unlike Recycle, the buffer stays usable and attached to its pool.
 func (b *Buffer) Reset() {
 	b.readPos = 0
 	if b.recycle() {

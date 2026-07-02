@@ -38,14 +38,14 @@ buf.Write([]byte("world"))
 data, _ := bufpool.ReadAllBytes(buf) // []byte("hello world"), zero-copy for *Buffer
 
 // Return the buffer to the pool for reuse. Do not use buf afterwards.
-buf.Return()
+buf.Recycle()
 ```
 
 Because a `Buffer` is an `io.Closer`, it also works with `defer`:
 
 ```go
 buf, _ := pool.Get()
-defer buf.Close() // equivalent to buf.Return()
+defer buf.Close() // equivalent to buf.Recycle()
 ```
 
 ## Usage
@@ -62,7 +62,7 @@ buf, _ := pool.Get()
 buf, _ = pool.GetFrom([]byte("payload"))
 ```
 
-Calling `Return` (or `Close`) recycles the buffer into the pool and resets it to
+Calling `Recycle` (or `Close`) recycles the buffer into the pool and resets it to
 the zero value, so it must not be used afterwards. Re-acquire one with `Get`.
 
 ### Reading and writing
@@ -95,7 +95,7 @@ buf := bufpool.NewBuffer([]byte("seed")...)
 buf.WriteString(" more")
 ```
 
-A detached buffer's `Return`/`Close` are no-ops. Use `Pool.Attach` to attach one
+A detached buffer's `Recycle`/`Close` are no-ops. Use `Pool.Attach` to attach one
 to a pool, and `Buffer.Detach` to remove it again:
 
 ```go
@@ -110,7 +110,7 @@ buf.Detach()
 
 `Reset` rewinds the read position and truncates the buffer for reuse while
 keeping it attached to its pool — useful in a tight loop where you want to reuse
-the same `Buffer` without round-tripping through `Get`/`Return`:
+the same `Buffer` without round-tripping through `Get`/`Recycle`:
 
 ```go
 buf, _ := pool.Get()
@@ -119,12 +119,12 @@ for _, item := range items {
     buf.WriteString(item)
     // ... use buf ...
 }
-buf.Return()
+buf.Recycle()
 ```
 
 ## The strike heuristic
 
-To avoid keeping unnecessarily large backing arrays alive, both `Return` and
+To avoid keeping unnecessarily large backing arrays alive, both `Recycle` and
 `Reset` apply the same heuristic when deciding whether to keep a buffer's
 backing array:
 
@@ -135,7 +135,7 @@ backing array:
   on the fifth it is discarded and replaced with a fresh, empty backing array.
 
 This means a single large usage is not kept alive forever by a continuous stream
-of small ones, while transient large usages are still tolerated. `Return`
+of small ones, while transient large usages are still tolerated. `Recycle`
 returns the resulting strike count, which is mainly useful for tests and tuning.
 
 ## API overview
@@ -152,7 +152,7 @@ returns the resulting strike count, which is mainly useful for tests and tuning.
 | `(*Buffer) Bytes / Len` | Unread bytes / total length. |
 | `(*Buffer) Rewind / Reset` | Rewind read position / truncate for reuse. |
 | `(*Buffer) SetBytes(p []byte)` | Replace contents (no copy). |
-| `(*Buffer) Return() int / Close() error` | Recycle into the pool. |
+| `(*Buffer) Recycle() int / Close() error` | Recycle into the pool. |
 | `(*Buffer) Detach()` | Detach from the pool. |
 | `ReadAllBytes(r io.Reader) ([]byte, error)` | Read all bytes, zero-copy for `*Buffer`. |
 

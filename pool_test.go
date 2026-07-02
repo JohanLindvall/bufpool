@@ -51,7 +51,7 @@ func Test_unit_Attach_Attached_Fail(t *testing.T) {
 func Test_unit_Pooled_Get(t *testing.T) {
 	p := New()
 	buf, _ := p.GetFrom([]byte("test"))
-	buf.Return()
+	buf.Recycle()
 	buf, _ = p.Get()
 	assert.Equal(t, 0, len(buf.buf))
 	assert.Same(t, p, buf.pool)
@@ -76,7 +76,7 @@ func Test_unit_Strikes(t *testing.T) {
 			buf, _ := p.Get()
 			buf.strikes = tt.initial
 			buf.buf = make([]byte, tt.size, tt.cap)
-			strikes := buf.Return()
+			strikes := buf.Recycle()
 			assert.Equal(t, tt.expected, strikes)
 		})
 	}
@@ -88,6 +88,6 @@ func Test_unit_Strikes_Read(t *testing.T) {
 	_, _ = buf.Write(make([]byte, 100000))
 	_, _ = io.Copy(io.Discard, buf)
 	buf.strikes = 999
-	strikes := buf.Return()
+	strikes := buf.Recycle()
 	assert.Equal(t, 0, strikes)
 }

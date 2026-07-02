@@ -85,7 +85,7 @@ func Test_unit_Len_Pooled(t *testing.T) {
 	p := New()
 	buf, _ := p.Get()
 	_, _ = buf.Write([]byte("test"))
-	buf.Return()
+	buf.Recycle()
 	n := buf.Len()
 	assert.Equal(t, 0, n)
 }
