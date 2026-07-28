@@ -78,7 +78,9 @@ func Test_unit_NoCopy(t *testing.T) {
 	// noCopy's methods exist only so go vet's copylocks check fires on
 	// by-value copies of Buffer; exercise them so they are not dead code.
 	var nc noCopy
-	assert.NotPanics(t, func() { nc.Lock(); nc.Unlock() })
+	nc.Lock()
+	defer nc.Unlock()
+	assert.NotNil(t, &nc)
 }
 
 func Test_unit_Concurrent(t *testing.T) {
