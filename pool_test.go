@@ -8,60 +8,30 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_unit_New(t *testing.T) {
-	p := New()
-	assert.NotNil(t, p)
+func Test_unit_ZeroValuePool(t *testing.T) {
+	// The zero Pool must be usable without a constructor.
+	var p Pool
+	buf := p.Get()
+	assert.NotNil(t, buf)
+	assert.Equal(t, 0, buf.Len())
+	_, _ = buf.WriteString("test")
+	buf.Release()
+	buf = p.Get()
+	assert.Equal(t, 0, buf.Len())
 }
 
 func Test_unit_Get(t *testing.T) {
-	p := New()
+	p := new(Pool)
 	buf := p.Get()
 	assert.NotNil(t, buf)
 	assert.Equal(t, 0, buf.Len())
 }
 
-func Test_unit_GetFrom(t *testing.T) {
-	p := New()
-	buf := p.GetFrom([]byte("test"))
-	assert.NotNil(t, buf)
-	assert.Equal(t, []byte("test"), buf.Bytes())
-}
-
-func Test_unit_GetFrom_Copies(t *testing.T) {
-	// GetFrom must copy: mutating the source afterwards must not affect the buffer.
-	p := New()
-	src := []byte("test")
-	buf := p.GetFrom(src)
-	src[0] = 'X'
-	assert.Equal(t, []byte("test"), buf.Bytes())
-}
-
-func Test_unit_Attach(t *testing.T) {
-	p := New()
-	buf := NewBuffer(nil)
-	err := p.Attach(buf)
-	assert.Nil(t, err)
-}
-
-func Test_unit_Attach_Twice_Fail(t *testing.T) {
-	p := New()
-	buf := NewBuffer(nil)
-	_ = p.Attach(buf)
-	err := p.Attach(buf)
-	assert.ErrorIs(t, err, ErrAttached)
-}
-
-func Test_unit_Attach_Attached_Fail(t *testing.T) {
-	p := New()
-	buf := p.Get()
-	err := p.Attach(buf)
-	assert.ErrorIs(t, err, ErrAttached)
-}
-
 func Test_unit_Pooled_Get(t *testing.T) {
-	p := New()
-	buf := p.GetFrom([]byte("test"))
-	buf.Recycle()
+	p := new(Pool)
+	buf := p.Get()
+	_, _ = buf.Write([]byte("test"))
+	buf.Release()
 	buf = p.Get()
 	assert.Equal(t, 0, len(buf.buf))
 	assert.Same(t, p, buf.pool)
@@ -84,7 +54,7 @@ func Test_unit_Strikes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := &poolStorage{strikes: tt.initial, buf: make([]byte, tt.size, tt.cap)}
-			kept := st.recycle()
+			kept := st.keep()
 			assert.Equal(t, tt.kept, kept)
 			assert.Equal(t, tt.expected, st.strikes)
 		})
@@ -92,20 +62,27 @@ func Test_unit_Strikes(t *testing.T) {
 }
 
 func Test_unit_Strikes_Read(t *testing.T) {
-	p := New()
+	p := new(Pool)
 	buf := p.Get()
 	_, _ = buf.Write(make([]byte, 100000))
 	_, _ = io.Copy(io.Discard, buf)
 	buf.strikes = 999
 	// The heuristic measures utilization by written length, not unread length,
 	// so a fully-read large buffer still counts as well-utilized.
-	kept := buf.recycle()
+	kept := buf.keep()
 	assert.True(t, kept)
 	assert.Equal(t, 0, buf.strikes)
 }
 
+func Test_unit_NoCopy(t *testing.T) {
+	// noCopy's methods exist only so go vet's copylocks check fires on
+	// by-value copies of Buffer; exercise them so they are not dead code.
+	var nc noCopy
+	assert.NotPanics(t, func() { nc.Lock(); nc.Unlock() })
+}
+
 func Test_unit_Concurrent(t *testing.T) {
-	p := New()
+	var p Pool
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -119,7 +96,7 @@ func Test_unit_Concurrent(t *testing.T) {
 					t.Errorf("got %q, %v", data, err)
 					return
 				}
-				buf.Recycle()
+				buf.Release()
 			}
 		}()
 	}

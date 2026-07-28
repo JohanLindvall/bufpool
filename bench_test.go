@@ -4,32 +4,32 @@ import (
 	"testing"
 )
 
-func BenchmarkGetRecycle(b *testing.B) {
-	p := New()
+func BenchmarkGetRelease(b *testing.B) {
+	var p Pool
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf := p.Get()
 		_, _ = buf.WriteString("hello world")
-		buf.Recycle()
+		buf.Release()
 	}
 }
 
-func BenchmarkGetRecycleParallel(b *testing.B) {
-	p := New()
+func BenchmarkGetReleaseParallel(b *testing.B) {
+	var p Pool
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			buf := p.Get()
 			_, _ = buf.WriteString("hello world")
-			buf.Recycle()
+			buf.Release()
 		}
 	})
 }
 
 func BenchmarkWrite(b *testing.B) {
-	p := New()
+	var p Pool
 	buf := p.Get()
-	defer buf.Recycle()
+	defer buf.Release()
 	data := make([]byte, 4096)
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
