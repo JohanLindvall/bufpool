@@ -3,9 +3,10 @@
 A small Go package for pooling and reusing byte buffers, reducing allocations
 and garbage-collector pressure in code that handles many short-lived buffers.
 
-A `Buffer` implements `io.Reader`, `io.Writer`, `io.StringWriter`,
-`io.ReaderFrom`, `io.WriterTo`, `io.Closer` and `fmt.Stringer`, so it drops
-into most code that already speaks the standard streaming interfaces. Buffers
+A `Buffer` implements `io.Reader`, `io.ByteReader`, `io.Writer`,
+`io.ByteWriter`, `io.StringWriter`, `io.ReaderFrom`, `io.WriterTo`,
+`io.Closer` and `fmt.Stringer`, so it drops into most code that already
+speaks the standard streaming interfaces. Buffers
 obtained from a `Pool` are returned to it for reuse, and an adaptive *strike*
 heuristic discards backing arrays that have grown large but are repeatedly
 under-utilized, so a single large write does not pin memory indefinitely. See
@@ -83,13 +84,18 @@ buf.WriteString("abcdef")
 p := make([]byte, 3)
 buf.Read(p)            // p = "abc", read position now at 3
 buf.Bytes()            // []byte("def") — the unread remainder (aliases the buffer)
-buf.String()           // "def" — a copy, safe to keep after release
-buf.Len()              // 3 — unread bytes, like bytes.Buffer.Len
+buf.Next(2)            // []byte("de") — consume 2 bytes zero-copy (aliases the buffer)
+buf.String()           // "f" — a copy, safe to keep after release
+buf.Len()              // 1 — unread bytes, like bytes.Buffer.Len
 buf.Size()             // 6 — total written length, including consumed bytes
 buf.Cap()              // capacity of the backing array
 
 buf.Rewind()           // reset the read position to re-read from the start
 ```
+
+`ReadByte` and `WriteByte` round out the byte-at-a-time interfaces
+(`io.ByteReader`, `io.ByteWriter`), so callers like `binary.ReadUvarint` work
+directly on a `Buffer` without a `bufio` wrapper.
 
 `WriteTo` streams the unread portion to any `io.Writer`, and `ReadFrom` fills
 the buffer from any `io.Reader`, so `io.Copy` in either direction avoids
@@ -98,6 +104,27 @@ intermediate copy buffers:
 ```go
 n, err := io.Copy(buf, resp.Body) // uses buf.ReadFrom, no 32 KiB scratch buffer
 ```
+
+### Streaming and compaction
+
+Reads never shrink the buffer on their own — the consumed prefix stays in
+place so `Rewind` can replay it. What keeps long-lived streaming bounded is
+*compaction on write*: whenever a write (`Write`, `WriteString`, `WriteByte`,
+`ReadFrom`) finds the buffer fully consumed, it discards the consumed bytes
+and reuses the backing array from the start. FIFO-style use — write a chunk,
+drain it, repeat — therefore stays at working-set size instead of growing
+with the total bytes ever streamed through.
+
+Two consequences to be aware of:
+
+- `Rewind` (and `Size`) cover the content written since the last compaction.
+  After reads alone, or writes interleaved with only *partial* reads, that is
+  everything ever written; only a write to a *fully*-drained buffer starts a
+  new epoch.
+- A buffer that is never fully drained before the next write is never
+  compacted, and grows with everything written to it. If you interleave
+  writes and reads but rarely drain completely, call `Reset` (or
+  `Release`/`Get`) at natural message boundaries.
 
 When the output size is known in advance, `Grow` pre-allocates capacity so
 subsequent writes do not reallocate:
@@ -111,7 +138,7 @@ buf.Write(payload)
 
 The zero-copy calls trade safety for speed; their rules are:
 
-- `Bytes` and `ReadAllBytes` return slices that **alias** the buffer.
+- `Bytes`, `Next` and `ReadAllBytes` return slices that **alias** the buffer.
   `Release`, `Close` and `Reset` invalidate them — the backing array re-enters
   the pool and the next `Get` may overwrite it. Copy the bytes (or use
   `String`) if they must outlive the buffer.
@@ -171,8 +198,9 @@ of small ones, while transient large usages are still tolerated.
 | `Pool` | Buffer pool; the zero value is ready to use. |
 | `(*Pool) Get() *Buffer` | Get an empty buffer attached to the pool. |
 | `NewBuffer(data []byte) *Buffer` | Create a detached buffer adopting `data` (no copy). |
-| `(*Buffer) Write / WriteString` | Append bytes / a string. |
-| `(*Buffer) Read / WriteTo` | Consume the unread portion. |
+| `(*Buffer) Write / WriteString / WriteByte` | Append bytes / a string / one byte. |
+| `(*Buffer) Read / ReadByte / WriteTo` | Consume the unread portion. |
+| `(*Buffer) Next(n int) []byte` | Consume the next n bytes zero-copy (aliasing). |
 | `(*Buffer) ReadFrom` | Fill from an `io.Reader` until EOF. |
 | `(*Buffer) Bytes / String` | Unread bytes (aliasing) / unread string (copy). |
 | `(*Buffer) Len / Size / Cap` | Unread length / total length / capacity. |

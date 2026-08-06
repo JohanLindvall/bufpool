@@ -2,11 +2,21 @@
 // allocations and garbage-collector pressure in code handling many
 // short-lived buffers.
 //
-// A Buffer implements io.Reader, io.Writer, io.StringWriter, io.ReaderFrom,
-// io.WriterTo, io.Closer and fmt.Stringer. Writes append to the buffer; reads
-// consume it from the front, tracked by an internal read position. Buffers
-// obtained from a Pool (whose zero value is ready to use) are returned to it
-// with Release (or Close), after which they must not be used.
+// A Buffer implements io.Reader, io.ByteReader, io.Writer, io.ByteWriter,
+// io.StringWriter, io.ReaderFrom, io.WriterTo, io.Closer and fmt.Stringer.
+// Writes append to the buffer; reads consume it from the front, tracked by an
+// internal read position. Buffers obtained from a Pool (whose zero value is
+// ready to use) are returned to it with Release (or Close), after which they
+// must not be used. A Pool is safe for concurrent use; an individual Buffer
+// is not.
+//
+// Streaming (interleaving writes and reads on one buffer) is supported: a
+// write to a fully-consumed buffer first compacts it, discarding the consumed
+// bytes and reusing the backing array from the start, so FIFO-style use stays
+// at working-set size instead of growing with the total bytes ever written.
+// Rewind consequently replays the content written since the last such
+// compaction; a buffer that is never fully drained before a write is never
+// compacted and replays everything.
 //
 // Releasing transfers the backing array back to the pool, so slices obtained
 // through Bytes or ReadAllBytes are invalidated by Release, Close and Reset;

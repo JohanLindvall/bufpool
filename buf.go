@@ -10,13 +10,20 @@ import (
 const minRead = 512
 
 // Buffer is a byte buffer that may be attached to a Pool. It implements
-// io.Reader, io.Writer, io.StringWriter, io.ReaderFrom, io.WriterTo,
-// io.Closer and fmt.Stringer. Writes append to the buffer; reads consume it
-// from the front, tracked by an internal read position. The zero value is a
-// usable, detached buffer.
+// io.Reader, io.ByteReader, io.Writer, io.ByteWriter, io.StringWriter,
+// io.ReaderFrom, io.WriterTo, io.Closer and fmt.Stringer. Writes append to
+// the buffer; reads consume it from the front, tracked by an internal read
+// position. The zero value is a usable, detached buffer.
+//
+// A write to a fully-consumed buffer first compacts it: the consumed bytes
+// are discarded and the backing array is reused from the start, so streaming
+// FIFO-style use (write, drain, repeat) stays at working-set size instead of
+// growing with the total bytes ever written. Rewind therefore replays only
+// content written since the last compaction; see Rewind.
 //
 // A Buffer must not be copied after first use (go vet reports such copies),
-// and must not be used after Release or Close.
+// and must not be used after Release or Close. Unlike a Pool, a Buffer is not
+// safe for concurrent use by multiple goroutines.
 type Buffer struct {
 	noCopy noCopy
 	poolStorage
@@ -27,7 +34,9 @@ type Buffer struct {
 
 var _ interface {
 	io.Reader
+	io.ByteReader
 	io.Writer
+	io.ByteWriter
 	io.StringWriter
 	io.ReaderFrom
 	io.WriterTo
@@ -35,12 +44,36 @@ var _ interface {
 	fmt.Stringer
 } = (*Buffer)(nil)
 
-// dropStorage clears the pooled storage's stale copy of a backing array the
-// buffer is abandoning, so the array does not stay reachable through
-// b.storage until the next Release.
-func (b *Buffer) dropStorage() {
+// abandon marks the current backing array as given up: the strike counter
+// belongs to the array and must not carry over to its replacement, and the
+// pooled storage's stale copy of the slice header must not keep the array
+// reachable through b.storage until the next Release.
+func (b *Buffer) abandon() {
+	b.strikes = 0
 	if b.storage != nil {
 		b.storage.buf = nil
+	}
+}
+
+// tryCompact resets a fully-consumed buffer so the backing array is reused
+// from the start. Called on the write paths only, so a drained-then-refilled
+// buffer stays at working-set size; after a merely partial read the consumed
+// prefix is kept and Rewind still replays it.
+func (b *Buffer) tryCompact() {
+	if b.readPos > 0 && b.readPos == len(b.buf) {
+		b.readPos = 0
+		b.buf = b.buf[:0]
+	}
+}
+
+// beforeAppend prepares to append n more bytes: a fully-consumed buffer is
+// compacted first (which may make growth unnecessary), and any remaining
+// shortfall is grown via Grow so the append below never reallocates behind
+// the pool's back.
+func (b *Buffer) beforeAppend(n int) {
+	b.tryCompact()
+	if n > cap(b.buf)-len(b.buf) {
+		b.Grow(n)
 	}
 }
 
@@ -62,9 +95,8 @@ func (b *Buffer) Detach() {
 // ownership of p transfers to the buffer (and, once released, to its pool)
 // and the caller must not use p after this call.
 func (b *Buffer) SetBytes(p []byte) {
-	b.strikes = 0
 	b.readPos = 0
-	b.dropStorage()
+	b.abandon()
 	b.buf = p
 }
 
@@ -110,7 +142,8 @@ func (b *Buffer) Len() int {
 }
 
 // Size returns the total length of the buffer, including any portion already
-// consumed by Read.
+// consumed by Read. Compaction (a write to a fully-consumed buffer) discards
+// the consumed bytes, so Size then counts from the last compaction.
 func (b *Buffer) Size() int {
 	return len(b.buf)
 }
@@ -124,8 +157,10 @@ func (b *Buffer) Cap() int {
 
 // Grow grows the buffer's capacity, if necessary, to guarantee space for
 // another n bytes: after Grow(n), at least n bytes can be written without
-// another allocation. Grow panics if n is negative or if the buffer would
-// grow beyond the maximum slice length.
+// another allocation. When it does allocate, Grow over-allocates (at least
+// doubling the capacity) so that repeated grow-and-fill cycles stay amortized
+// O(n) rather than reallocating on every round. Grow panics if n is negative
+// or if the buffer would grow beyond the maximum slice length.
 func (b *Buffer) Grow(n int) {
 	if n < 0 {
 		panic("bufpool.Buffer.Grow: negative count")
@@ -133,20 +168,26 @@ func (b *Buffer) Grow(n int) {
 	if cap(b.buf)-len(b.buf) >= n {
 		return
 	}
-	buf := makeBuf(len(b.buf), len(b.buf)+n)
+	need := len(b.buf) + n
+	if need < 0 { // int overflow
+		panic("bufpool.Buffer: too large")
+	}
+	// 2*cap may overflow to negative; max then falls back to the exact need.
+	// 64 mirrors bytes.Buffer's smallBufferSize, skipping the tiny first steps
+	// of the doubling ladder.
+	buf := makeBuf(len(b.buf), max(need, 2*cap(b.buf), 64))
 	copy(buf, b.buf)
-	b.strikes = 0
-	b.dropStorage()
+	b.abandon()
 	b.buf = buf
 }
 
 // makeBuf allocates a backing array, converting the runtime's allocation-size
-// panic (int overflow or beyond the maximum slice length) into the documented
-// Grow panic, mirroring bytes.growSlice.
+// panic (beyond the maximum slice length) into the documented too-large
+// panic, mirroring bytes.growSlice.
 func makeBuf(length, capacity int) (buf []byte) {
 	defer func() {
 		if recover() != nil {
-			panic("bufpool.Buffer.Grow: too large")
+			panic("bufpool.Buffer: too large")
 		}
 	}()
 	return make([]byte, length, capacity)
@@ -171,6 +212,31 @@ func (b *Buffer) Read(p []byte) (int, error) {
 	n := copy(p, b.buf[b.readPos:])
 	b.readPos += n
 	return n, nil
+}
+
+// ReadByte consumes and returns the next unread byte, advancing the read
+// position. It returns io.EOF once the buffer is fully consumed. ReadByte
+// implements io.ByteReader.
+func (b *Buffer) ReadByte() (byte, error) {
+	if b.readPos == len(b.buf) {
+		return 0, io.EOF
+	}
+	c := b.buf[b.readPos]
+	b.readPos++
+	return c, nil
+}
+
+// Next consumes the next n unread bytes and returns them as a slice, as if
+// read by Read; if fewer than n bytes are unread, Next returns all of them.
+// Like Bytes, the slice aliases the buffer's backing array and is only valid
+// until the next mutating call. Next panics if n is negative.
+func (b *Buffer) Next(n int) []byte {
+	if n > b.Len() {
+		n = b.Len()
+	}
+	data := b.buf[b.readPos : b.readPos+n]
+	b.readPos += n
+	return data
 }
 
 // WriteTo writes the unread portion of the buffer to w, advancing the read
@@ -198,11 +264,11 @@ func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
 // encountered during the read. ReadFrom implements io.ReaderFrom, so io.Copy
 // into a Buffer needs no intermediate copy buffer.
 func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
+	b.tryCompact()
 	var total int64
 	for {
 		if cap(b.buf)-len(b.buf) < minRead {
-			// Grow geometrically so repeated fills stay amortized O(n).
-			b.Grow(max(minRead, cap(b.buf)))
+			b.Grow(minRead)
 		}
 		n, err := r.Read(b.buf[len(b.buf):cap(b.buf)])
 		if n < 0 {
@@ -222,31 +288,34 @@ func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
 // Write appends p to the buffer, growing the backing array as needed. It always
 // returns len(p) and a nil error. Write implements io.Writer.
 func (b *Buffer) Write(p []byte) (int, error) {
-	lp := len(p)
-	if len(b.buf)+lp > cap(b.buf) {
-		b.strikes = 0
-		b.dropStorage() // append is about to abandon the current array
-	}
-
+	b.beforeAppend(len(p))
 	b.buf = append(b.buf, p...)
-	return lp, nil
+	return len(p), nil
 }
 
 // WriteString appends s to the buffer without copying it into a temporary
 // []byte first. It always returns len(s) and a nil error. WriteString
 // implements io.StringWriter.
 func (b *Buffer) WriteString(s string) (int, error) {
-	if len(b.buf)+len(s) > cap(b.buf) {
-		b.strikes = 0
-		b.dropStorage() // append is about to abandon the current array
-	}
-
+	b.beforeAppend(len(s))
 	b.buf = append(b.buf, s...)
 	return len(s), nil
 }
 
-// Rewind resets the read position to zero so the buffer's full contents can be
-// read again. It does not modify the contents.
+// WriteByte appends c to the buffer, growing the backing array as needed. It
+// always returns a nil error. WriteByte implements io.ByteWriter.
+func (b *Buffer) WriteByte(c byte) error {
+	b.beforeAppend(1)
+	b.buf = append(b.buf, c)
+	return nil
+}
+
+// Rewind resets the read position to zero so the buffer's contents can be
+// read again. It does not modify the contents. Because a write to a
+// fully-consumed buffer compacts it (discarding the consumed bytes), Rewind
+// replays the content written since that compaction; after reads alone, or
+// writes interleaved with only partial reads, that is everything ever
+// written.
 func (b *Buffer) Rewind() {
 	b.readPos = 0
 }
@@ -261,11 +330,8 @@ func (b *Buffer) Reset() {
 	if b.keep() {
 		b.buf = b.buf[:0]
 	} else {
-		b.strikes = 0
+		b.abandon() // drops the pooled copy of the slice header too
 		b.buf = nil
-		// Drop the pooled copy of the slice header too, so the discarded
-		// array is not kept reachable until the next Release.
-		b.dropStorage()
 	}
 }
 
@@ -281,6 +347,10 @@ func ReadAllBytes(r io.Reader) ([]byte, error) {
 	if bg, ok := r.(*Buffer); ok {
 		result := bg.buf[bg.readPos:]
 		bg.readPos = len(bg.buf)
+		if result == nil {
+			// Match the io.ReadAll fallback, which never returns a nil slice.
+			result = []byte{}
+		}
 		return result, nil
 	}
 	return io.ReadAll(r)

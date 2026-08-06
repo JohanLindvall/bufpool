@@ -81,8 +81,9 @@ reset. The `sync.Pool` idioms and bpool never evict by size at all.
 ## Semantics
 
 `bufpool.Buffer` is differentially fuzzed against `bytes.Buffer` (see
-`_bench/fuzz_test.go`): millions of random `Write`/`WriteString`/`Read`/
-`Len`/`Bytes`/`WriteTo`/`Reset` programs execute identically on both, so code
+`_bench/fuzz_test.go`): millions of random `Write`/`WriteString`/`WriteByte`/
+`Read`/`ReadByte`/`Next`/`Len`/`Bytes`/`WriteTo`/`Reset` programs execute
+identically on both, so code
 ported from `bytes.Buffer` keeps its behavior for the fuzzed surface. One
 known divergence outside it: a zero-length `Read` on a drained buffer returns
 `(0, io.EOF)` here where `bytes.Buffer` returns `(0, nil)` — both legal under

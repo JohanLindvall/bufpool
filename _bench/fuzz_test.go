@@ -1,6 +1,6 @@
 // Differential fuzz: bufpool.Buffer against bytes.Buffer for the operations
-// whose semantics the package documents as matching (Write, WriteString, Read,
-// Len, Bytes, WriteTo, Reset).
+// whose semantics the package documents as matching (Write, WriteString,
+// WriteByte, Read, ReadByte, Next, Len, Bytes, WriteTo, Reset).
 package compare
 
 import (
@@ -21,7 +21,7 @@ func FuzzDifferential(f *testing.F) {
 
 		chunk := []byte("0123456789abcdef0123456789abcdef")
 		for i := 0; i+1 < len(program); i += 2 {
-			op, arg := program[i]%6, int(program[i+1])
+			op, arg := program[i]%9, int(program[i+1])
 			switch op {
 			case 0: // Write
 				g, _ := got.Write(chunk[:arg%len(chunk)])
@@ -61,6 +61,23 @@ func FuzzDifferential(f *testing.F) {
 			case 5: // Reset
 				got.Reset()
 				want.Reset()
+			case 6: // WriteByte
+				gerr := got.WriteByte(byte(arg))
+				werr := want.WriteByte(byte(arg))
+				if (gerr == nil) != (werr == nil) {
+					t.Fatalf("op %d WriteByte: %v want %v", i, gerr, werr)
+				}
+			case 7: // ReadByte
+				gc, gerr := got.ReadByte()
+				wc, werr := want.ReadByte()
+				if gc != wc || (gerr == nil) != (werr == nil) {
+					t.Fatalf("op %d ReadByte: (%q,%v) want (%q,%v)", i, gc, gerr, wc, werr)
+				}
+			case 8: // Next
+				g, w := got.Next(arg), want.Next(arg)
+				if !bytes.Equal(g, w) {
+					t.Fatalf("op %d Next(%d): %q want %q", i, arg, g, w)
+				}
 			}
 		}
 		if !bytes.Equal(got.Bytes(), want.Bytes()) || got.Len() != want.Len() {

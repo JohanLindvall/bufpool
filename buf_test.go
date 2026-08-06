@@ -319,13 +319,31 @@ func Test_unit_Grow_TooLarge(t *testing.T) {
 	// message, not a generic makeslice runtime error — both when len+n
 	// overflows int and when it merely exceeds the maximum allocation.
 	buf := NewBuffer([]byte("x"))
-	assert.PanicsWithValue(t, "bufpool.Buffer.Grow: too large", func() {
+	assert.PanicsWithValue(t, "bufpool.Buffer: too large", func() {
 		buf.Grow(math.MaxInt) // 1+MaxInt overflows
 	})
 	buf2 := NewBuffer(nil)
-	assert.PanicsWithValue(t, "bufpool.Buffer.Grow: too large", func() {
+	assert.PanicsWithValue(t, "bufpool.Buffer: too large", func() {
 		buf2.Grow(math.MaxInt) // no overflow, but beyond the max slice length
 	})
+}
+
+func Test_unit_Grow_Amortized(t *testing.T) {
+	// Grow over-allocates (at least doubling), so a Grow+Write loop causes
+	// O(log n) reallocations, not one per iteration.
+	buf := NewBuffer(nil)
+	reallocs := 0
+	chunk := make([]byte, 100)
+	for i := 0; i < 1000; i++ {
+		c := buf.Cap()
+		buf.Grow(len(chunk))
+		if buf.Cap() != c {
+			reallocs++
+		}
+		_, _ = buf.Write(chunk)
+	}
+	assert.Equal(t, 100_000, buf.Len())
+	assert.Less(t, reallocs, 20) // ~log2(100000/64) if doubling holds
 }
 
 func Test_unit_Grow_SufficientCapacity(t *testing.T) {
@@ -446,6 +464,106 @@ func Test_unit_ReadAllBytesTwice_Generic(t *testing.T) {
 	_, _ = ReadAllBytes(buf)
 	data, err := ReadAllBytes(buf)
 	assert.Nil(t, err)
+	assert.Equal(t, 0, len(data))
+}
+
+func Test_unit_Write_CompactsDrainedBuffer(t *testing.T) {
+	// A write to a fully-consumed buffer reuses the backing array from the
+	// start instead of appending behind the consumed prefix, so FIFO-style
+	// use (write, drain, repeat) stays at working-set size.
+	buf := NewBuffer(nil)
+	p := make([]byte, 1024)
+	for i := 0; i < 1000; i++ {
+		_, _ = buf.Write(p)
+		_, err := io.ReadFull(buf, p)
+		assert.Nil(t, err)
+	}
+	assert.Equal(t, 0, buf.Len())
+	assert.Less(t, buf.Cap(), 1<<16, "drained-and-refilled buffer must not grow with total bytes written")
+}
+
+func Test_unit_ReadFrom_CompactsDrainedBuffer(t *testing.T) {
+	// ReadFrom compacts a fully-consumed buffer before filling, like Write.
+	buf := NewBuffer(nil)
+	_, _ = buf.WriteString("abc")
+	_, _ = io.Copy(io.Discard, buf)
+	n, err := buf.ReadFrom(strings.NewReader("def"))
+	assert.Nil(t, err)
+	assert.Equal(t, int64(3), n)
+	assert.Equal(t, "def", buf.String())
+	assert.Equal(t, 3, buf.Size())
+}
+
+func Test_unit_Rewind_AfterPartialRead(t *testing.T) {
+	// Compaction happens only when the buffer is fully consumed; after a
+	// partial read, writes append and Rewind still replays everything.
+	buf := NewBuffer(nil)
+	_, _ = buf.WriteString("abc")
+	_, _ = buf.Read(make([]byte, 2))
+	_, _ = buf.WriteString("def")
+	buf.Rewind()
+	assert.Equal(t, "abcdef", buf.String())
+}
+
+func Test_unit_Rewind_AfterCompactingWrite(t *testing.T) {
+	// A write to a fully-drained buffer compacts it: the consumed bytes are
+	// discarded and Rewind replays only what was written since.
+	buf := NewBuffer(nil)
+	_, _ = buf.WriteString("abc")
+	_, _ = io.Copy(io.Discard, buf)
+	_, _ = buf.WriteString("def")
+	buf.Rewind()
+	assert.Equal(t, "def", buf.String())
+	assert.Equal(t, 3, buf.Size())
+}
+
+func Test_unit_WriteByte_ReadByte(t *testing.T) {
+	p := new(Pool)
+	buf := p.Get()
+	defer buf.Release()
+	assert.Nil(t, buf.WriteByte('a'))
+	assert.Nil(t, buf.WriteByte('b'))
+	c, err := buf.ReadByte()
+	assert.Nil(t, err)
+	assert.Equal(t, byte('a'), c)
+	c, err = buf.ReadByte()
+	assert.Nil(t, err)
+	assert.Equal(t, byte('b'), c)
+	_, err = buf.ReadByte()
+	assert.Same(t, io.EOF, err)
+}
+
+func Test_unit_WriteByte_DropsPooledStorageRef(t *testing.T) {
+	// WriteByte growing past the current capacity abandons the array like
+	// Write does, dropping the pooled storage's stale slice header.
+	buf := pooledBuffer(4)
+	for i := 0; i < 5; i++ {
+		assert.Nil(t, buf.WriteByte('x'))
+	}
+	assert.Equal(t, "xxxxx", buf.String())
+	assert.Nil(t, buf.storage.buf)
+}
+
+func Test_unit_Next(t *testing.T) {
+	buf := NewBuffer([]byte("abcdef"))
+	assert.Equal(t, []byte("abc"), buf.Next(3))
+	assert.Equal(t, []byte("de"), buf.Next(2))
+	assert.Equal(t, []byte("f"), buf.Next(10)) // clamped to the unread remainder
+	assert.Equal(t, 0, len(buf.Next(1)))
+	assert.Equal(t, 0, buf.Len())
+}
+
+func Test_unit_Next_Negative_Panics(t *testing.T) {
+	buf := NewBuffer([]byte("abc"))
+	assert.Panics(t, func() { buf.Next(-1) })
+}
+
+func Test_unit_ReadAllBytes_EmptyNonNil(t *testing.T) {
+	// Matches the io.ReadAll fallback: an empty result is a non-nil empty
+	// slice regardless of the reader's dynamic type.
+	data, err := ReadAllBytes(NewBuffer(nil))
+	assert.Nil(t, err)
+	assert.NotNil(t, data)
 	assert.Equal(t, 0, len(data))
 }
 
