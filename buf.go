@@ -15,11 +15,11 @@ const minRead = 512
 // the buffer; reads consume it from the front, tracked by an internal read
 // position. The zero value is a usable, detached buffer.
 //
-// A write to a fully-consumed buffer first compacts it: the consumed bytes
-// are discarded and the backing array is reused from the start, so streaming
-// FIFO-style use (write, drain, repeat) stays at working-set size instead of
-// growing with the total bytes ever written. Rewind therefore replays only
-// content written since the last compaction; see Rewind.
+// Reads never reclaim memory: the consumed prefix stays in place so Rewind
+// can replay it, and writes append after it. A buffer used as a long-lived
+// FIFO (write, read, repeat) therefore grows with the total bytes streamed
+// through it, not the working set; bound it by calling Reset at natural
+// message boundaries, or by round-tripping through Release and Get.
 //
 // A Buffer must not be copied after first use (go vet reports such copies),
 // and must not be used after Release or Close. Unlike a Pool, a Buffer is not
@@ -55,23 +55,10 @@ func (b *Buffer) abandon() {
 	}
 }
 
-// tryCompact resets a fully-consumed buffer so the backing array is reused
-// from the start. Called on the write paths only, so a drained-then-refilled
-// buffer stays at working-set size; after a merely partial read the consumed
-// prefix is kept and Rewind still replays it.
-func (b *Buffer) tryCompact() {
-	if b.readPos > 0 && b.readPos == len(b.buf) {
-		b.readPos = 0
-		b.buf = b.buf[:0]
-	}
-}
-
-// beforeAppend prepares to append n more bytes: a fully-consumed buffer is
-// compacted first (which may make growth unnecessary), and any remaining
-// shortfall is grown via Grow so the append below never reallocates behind
-// the pool's back.
+// beforeAppend prepares to append n more bytes: any capacity shortfall is
+// grown via Grow so the append below never reallocates behind the pool's
+// back.
 func (b *Buffer) beforeAppend(n int) {
-	b.tryCompact()
 	if n > cap(b.buf)-len(b.buf) {
 		b.Grow(n)
 	}
@@ -142,8 +129,7 @@ func (b *Buffer) Len() int {
 }
 
 // Size returns the total length of the buffer, including any portion already
-// consumed by Read. Compaction (a write to a fully-consumed buffer) discards
-// the consumed bytes, so Size then counts from the last compaction.
+// consumed by Read.
 func (b *Buffer) Size() int {
 	return len(b.buf)
 }
@@ -264,7 +250,6 @@ func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
 // encountered during the read. ReadFrom implements io.ReaderFrom, so io.Copy
 // into a Buffer needs no intermediate copy buffer.
 func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
-	b.tryCompact()
 	var total int64
 	for {
 		if cap(b.buf)-len(b.buf) < minRead {
@@ -310,12 +295,12 @@ func (b *Buffer) WriteByte(c byte) error {
 	return nil
 }
 
-// Rewind resets the read position to zero so the buffer's contents can be
-// read again. It does not modify the contents. Because a write to a
-// fully-consumed buffer compacts it (discarding the consumed bytes), Rewind
-// replays the content written since that compaction; after reads alone, or
-// writes interleaved with only partial reads, that is everything ever
-// written.
+// Rewind resets the read position to zero so the buffer's full contents can
+// be read again. It does not modify the contents. The replay is complete:
+// reads and writes never discard the consumed prefix, so Rewind always
+// reaches back to the last point the buffer was empty — its creation, or the
+// most recent Reset or SetBytes. (Supporting this replay is why reads retain
+// the consumed prefix; see the package documentation on streaming.)
 func (b *Buffer) Rewind() {
 	b.readPos = 0
 }

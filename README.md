@@ -105,26 +105,18 @@ intermediate copy buffers:
 n, err := io.Copy(buf, resp.Body) // uses buf.ReadFrom, no 32 KiB scratch buffer
 ```
 
-### Streaming and compaction
+### Streaming
 
-Reads never shrink the buffer on their own — the consumed prefix stays in
-place so `Rewind` can replay it. What keeps long-lived streaming bounded is
-*compaction on write*: whenever a write (`Write`, `WriteString`, `WriteByte`,
-`ReadFrom`) finds the buffer fully consumed, it discards the consumed bytes
-and reuses the backing array from the start. FIFO-style use — write a chunk,
-drain it, repeat — therefore stays at working-set size instead of growing
-with the total bytes ever streamed through.
-
-Two consequences to be aware of:
-
-- `Rewind` (and `Size`) cover the content written since the last compaction.
-  After reads alone, or writes interleaved with only *partial* reads, that is
-  everything ever written; only a write to a *fully*-drained buffer starts a
-  new epoch.
-- A buffer that is never fully drained before the next write is never
-  compacted, and grows with everything written to it. If you interleave
-  writes and reads but rarely drain completely, call `Reset` (or
-  `Release`/`Get`) at natural message boundaries.
+Reads never reclaim memory: the consumed prefix stays in place — that is what
+lets `Rewind` replay the full contents — and writes always append after it.
+`Rewind`'s replay is therefore complete: it always reaches back to the last
+point the buffer was empty (its creation, or the most recent `Reset` or
+`SetBytes`), no matter how reads and writes were interleaved in between.
+Used as a long-lived FIFO on a single buffer (write a chunk, read it, repeat),
+the buffer therefore grows with the total bytes streamed through it, not with
+the working set. Bound it by calling `Reset` at natural message boundaries
+(it rewinds, truncates, and applies the same keep-or-discard heuristic as the
+pool), or by round-tripping through `Release`/`Get`.
 
 When the output size is known in advance, `Grow` pre-allocates capacity so
 subsequent writes do not reallocate:

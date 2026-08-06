@@ -10,13 +10,12 @@
 // must not be used. A Pool is safe for concurrent use; an individual Buffer
 // is not.
 //
-// Streaming (interleaving writes and reads on one buffer) is supported: a
-// write to a fully-consumed buffer first compacts it, discarding the consumed
-// bytes and reusing the backing array from the start, so FIFO-style use stays
-// at working-set size instead of growing with the total bytes ever written.
-// Rewind consequently replays the content written since the last such
-// compaction; a buffer that is never fully drained before a write is never
-// compacted and replays everything.
+// Reads never reclaim memory: the consumed prefix stays in place so Rewind
+// can replay the full contents, and writes append after it. A buffer used as
+// a long-lived FIFO (write, read, repeat) therefore grows with the total
+// bytes streamed through it, not the working set; bound it by calling Reset
+// at natural message boundaries, or by round-tripping through Release and
+// Get.
 //
 // Releasing transfers the backing array back to the pool, so slices obtained
 // through Bytes or ReadAllBytes are invalidated by Release, Close and Reset;

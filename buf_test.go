@@ -467,54 +467,18 @@ func Test_unit_ReadAllBytesTwice_Generic(t *testing.T) {
 	assert.Equal(t, 0, len(data))
 }
 
-func Test_unit_Write_CompactsDrainedBuffer(t *testing.T) {
-	// A write to a fully-consumed buffer reuses the backing array from the
-	// start instead of appending behind the consumed prefix, so FIFO-style
-	// use (write, drain, repeat) stays at working-set size.
-	buf := NewBuffer(nil)
-	p := make([]byte, 1024)
-	for i := 0; i < 1000; i++ {
-		_, _ = buf.Write(p)
-		_, err := io.ReadFull(buf, p)
-		assert.Nil(t, err)
-	}
-	assert.Equal(t, 0, buf.Len())
-	assert.Less(t, buf.Cap(), 1<<16, "drained-and-refilled buffer must not grow with total bytes written")
-}
-
-func Test_unit_ReadFrom_CompactsDrainedBuffer(t *testing.T) {
-	// ReadFrom compacts a fully-consumed buffer before filling, like Write.
-	buf := NewBuffer(nil)
-	_, _ = buf.WriteString("abc")
-	_, _ = io.Copy(io.Discard, buf)
-	n, err := buf.ReadFrom(strings.NewReader("def"))
-	assert.Nil(t, err)
-	assert.Equal(t, int64(3), n)
-	assert.Equal(t, "def", buf.String())
-	assert.Equal(t, 3, buf.Size())
-}
-
-func Test_unit_Rewind_AfterPartialRead(t *testing.T) {
-	// Compaction happens only when the buffer is fully consumed; after a
-	// partial read, writes append and Rewind still replays everything.
+func Test_unit_Rewind_AfterInterleavedWrites(t *testing.T) {
+	// Writes always append after the consumed prefix — even when the buffer
+	// is fully drained — so Rewind replays everything ever written.
 	buf := NewBuffer(nil)
 	_, _ = buf.WriteString("abc")
 	_, _ = buf.Read(make([]byte, 2))
 	_, _ = buf.WriteString("def")
+	_, _ = io.Copy(io.Discard, buf) // drain fully
+	_, _ = buf.ReadFrom(strings.NewReader("ghi"))
 	buf.Rewind()
-	assert.Equal(t, "abcdef", buf.String())
-}
-
-func Test_unit_Rewind_AfterCompactingWrite(t *testing.T) {
-	// A write to a fully-drained buffer compacts it: the consumed bytes are
-	// discarded and Rewind replays only what was written since.
-	buf := NewBuffer(nil)
-	_, _ = buf.WriteString("abc")
-	_, _ = io.Copy(io.Discard, buf)
-	_, _ = buf.WriteString("def")
-	buf.Rewind()
-	assert.Equal(t, "def", buf.String())
-	assert.Equal(t, 3, buf.Size())
+	assert.Equal(t, "abcdefghi", buf.String())
+	assert.Equal(t, 9, buf.Size())
 }
 
 func Test_unit_WriteByte_ReadByte(t *testing.T) {
