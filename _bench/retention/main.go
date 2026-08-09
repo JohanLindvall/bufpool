@@ -48,7 +48,7 @@ func main() {
 		p := new(bufpool.Pool)
 		cycle = func(payload []byte) int {
 			b := p.Get()
-			c := cap(b.Bytes())
+			c := b.Cap()
 			_, _ = b.Write(payload)
 			b.Release()
 			return c

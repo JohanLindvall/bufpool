@@ -57,6 +57,34 @@ func payload(pool *bufpool.Pool) io.ReadCloser {
 }
 ```
 
+The consumer now decides *when* the buffer is released, possibly on another
+goroutine, so hold no slice from `Bytes`/`Next`/`ReadAllBytes` across the
+handoff. **`net/http` is the case to watch.** Since `*Buffer` already satisfies
+`io.ReadCloser`, `http.NewRequest` adopts it as `req.Body` verbatim instead of
+wrapping it, and the transport closes — and therefore releases — it before
+`Do` returns. Its type switch also special-cases only `*bytes.Buffer`,
+`*bytes.Reader` and `*strings.Reader`, so the request goes out with
+`ContentLength -1` and `Transfer-Encoding: chunked`, and with a nil `GetBody`
+that stops a 307/308 redirect from replaying the body.
+
+These are two separate problems and neither remedy fixes both — `Detach` only
+stops the release, and the fields only fix the wire format — so do both:
+
+```go
+buf.Detach() // the transport's Close must not return it to the pool
+req, _ := http.NewRequest("POST", url, buf)
+req.ContentLength = int64(buf.Len())                       // identity, not chunked
+req.GetBody = func() (io.ReadCloser, error) {              // replay on 307/308
+    buf.Rewind()
+    return buf, nil
+}
+```
+
+Returning `buf` itself from `GetBody` is only safe because `Detach` has already
+made its `Close` a no-op. Drop the `GetBody` if you do not need redirects
+followed; without one the client returns the 307/308 response rather than
+following it.
+
 ## Usage
 
 ### Pooling
@@ -116,7 +144,14 @@ Used as a long-lived FIFO on a single buffer (write a chunk, read it, repeat),
 the buffer therefore grows with the total bytes streamed through it, not with
 the working set. Bound it by calling `Reset` at natural message boundaries
 (it rewinds, truncates, and applies the same keep-or-discard heuristic as the
-pool), or by round-tripping through `Release`/`Get`.
+pool).
+
+A `Release`/`Get` round-trip does **not** bound it: `Get` re-slices the same
+array to `[:0]`, so the round trip resets `Size` but not `Cap`. The growth also
+outlives the buffer — a FIFO buffer that grew to N bytes hands an N-byte array
+to the pool, where it scores as well utilized and is handed on to unrelated
+callers regardless of how little they asked for. `Reset` is what bounds
+pool-wide memory, not just one buffer's.
 
 When the output size is known in advance, `Grow` pre-allocates capacity so
 subsequent writes do not reallocate:
@@ -126,6 +161,12 @@ buf.Grow(len(payload))
 buf.Write(payload)
 ```
 
+Reserved capacity is not exempt from the strike heuristic below, which measures
+utilization as written length against capacity. Capacity above 64 KiB that you
+reserve but leave unfilled counts as under-utilized, so a buffer that reserves
+far more than it writes loses the reservation every fifth cycle. Reserve close
+to what you will actually write.
+
 ### Ownership and aliasing
 
 The zero-copy calls trade safety for speed; their rules are:
@@ -134,9 +175,50 @@ The zero-copy calls trade safety for speed; their rules are:
   `Release`, `Close` and `Reset` invalidate them — the backing array re-enters
   the pool and the next `Get` may overwrite it. Copy the bytes (or use
   `String`) if they must outlive the buffer.
+- Those slices are capped to their length (a three-index slice), so
+  **appending** to one allocates a fresh array rather than writing into the
+  buffer. This diverges from `bytes.Buffer`, whose `Bytes` and `Next` slices
+  carry capacity out to the end of the backing array — there, appending to a
+  `Next` slice silently overwrites the bytes not yet read. Reading through them
+  still aliases the buffer, so the lifetime rule above continues to apply.
 - `NewBuffer` and `SetBytes` **adopt** the given slice as the backing array
   without copying. Ownership transfers to the buffer (and, once released, to
-  the pool): the caller must not use the slice afterwards.
+  the pool): the caller must not use the slice afterwards. Because the pool
+  sizes a buffer by `cap()` alone, adopting a capacity-capped sub-slice of a
+  much larger array (`arena[:n:n]`) hands the pool the whole array while the
+  heuristic classifies it by the small capacity, and it is never evicted — pass
+  a full-capacity slice or `bytes.Clone` it instead.
+- Handing a buffer to a consumer that calls `Close` transfers release timing to
+  that consumer, possibly on another goroutine, so no aliased slice may be held
+  across the call. `net/http` needs particular care — see below.
+
+### Secrets
+
+Nothing on the `Release`/`Get` path clears a backing array, so a released
+buffer's bytes stay resident in the pool and are handed to the next, unrelated
+caller — readable through that buffer's spare capacity, and passed to any
+`io.Reader` that `ReadFrom` gives the spare capacity to. `Wipe` zeroes the whole
+array (unread bytes, consumed prefix and spare capacity alike) and then resets
+the buffer:
+
+```go
+buf := pool.Get()
+defer func() { buf.Wipe(); buf.Release() }()
+```
+
+Unlike `Reset`, `Wipe` does not apply the keep-or-discard heuristic, so the
+following `Release` or `Reset` is still the only application — wiping does not
+charge the array twice. It does leave the buffer empty for that application to
+score, so an array above 64 KiB takes a strike where releasing it unwiped would
+have kept it, and is dropped after five such cycles. That is the intended trade
+for not leaving secrets in the pool.
+
+It costs a `memclr` of the full capacity, which is why it is opt-in rather than
+part of `Release`. It reaches from the current backing slice's start through its
+capacity, so for a slice adopted via `NewBuffer`/`SetBytes` it does not touch
+bytes before that start or beyond a capped capacity — and it cannot reach an
+array the buffer has already outgrown or otherwise replaced. Wipe before the
+buffer grows, not only at the end.
 
 ### Detached buffers
 
@@ -178,10 +260,20 @@ backing array:
 - Buffers that are at least 50% utilized are always kept (strike counter
   cleared).
 - An oversized, under-utilized buffer is given up to four consecutive *strikes*;
-  on the fifth it is discarded and replaced with a fresh, empty backing array.
+  on the fifth it is discarded — the buffer is left with **no backing array at
+  all** (`Cap()` returns 0), and the next write allocates one from scratch.
 
 This means a single large usage is not kept alive forever by a continuous stream
 of small ones, while transient large usages are still tolerated.
+
+Two details worth knowing. The four-strike budget is spent only by
+*consecutive* under-utilized applications, so a large but well-utilized release
+recurring more often than once per five small ones clears the counter every time
+and keeps its array resident indefinitely. And each `Reset` and each `Release`
+counts as one application, so a `Reset` immediately before a `Release` charges
+the array two strikes for one use — it is redundant anyway, since `Release`
+resets the handle. The [package documentation](https://pkg.go.dev/github.com/JohanLindvall/bufpool)
+is the authoritative description of the policy.
 
 ## API overview
 
@@ -198,6 +290,8 @@ of small ones, while transient large usages are still tolerated.
 | `(*Buffer) Len / Size / Cap` | Unread length / total length / capacity. |
 | `(*Buffer) Grow(n int)` | Pre-allocate space for `n` more bytes. |
 | `(*Buffer) Rewind / Reset` | Rewind read position / truncate for reuse. |
+| `(*Buffer) Wipe()` | Zero the whole backing array, then reset. |
+| `ErrTooLarge` | Panic value when a buffer cannot grow further. |
 | `(*Buffer) SetBytes(p []byte)` | Replace contents, adopting `p` (no copy), and rewind. |
 | `(*Buffer) Release() / Close() error` | Release into the pool. |
 | `(*Buffer) Detach()` | Detach from the pool; Release/Close become no-ops. |

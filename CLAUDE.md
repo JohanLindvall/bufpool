@@ -15,7 +15,9 @@ Consequences, documented in README ("Streaming") and doc.go:
 
 - A buffer used as a long-lived FIFO grows with the total bytes streamed
   through it, not the working set. The supported way to bound it is `Reset`
-  at message boundaries or a `Release`/`Get` round-trip.
+  at message boundaries. A `Release`/`Get` round-trip does *not* bound it:
+  `Get` re-slices the same array to `[:0]`, so it resets `Size` but not `Cap`,
+  and the grown array is inherited by whichever unrelated caller gets it next.
 - Do not "fix" this by adding compaction to the write paths (`Write`,
   `WriteString`, `WriteByte`, `ReadFrom`); that trades away the Rewind/Size
   contract. If bounded FIFO use ever becomes a requirement, add an explicit
@@ -35,9 +37,25 @@ and only capacity/retention behavior diverges.
   not pinned until the next `Release`.
 - `keep()` must run before the length is truncated; utilization is measured
   on the written length.
-- Oversized-allocation panics are unified as `"bufpool.Buffer: too large"`
-  (via `makeBuf`); write-path reallocation is routed through `Grow` for this
-  reason.
+- Oversized-allocation panics are unified as the exported `ErrTooLarge` (via
+  `makeBuf`); write-path reallocation is routed through `Grow` for this reason.
+  It must stay an `error` value, not a string — that is the whole point of
+  exporting it, and `buf_test.go` asserts `recover()` yields something
+  `errors.Is`-comparable. The programmer-error panics (negative counts,
+  contract-violating `io.Writer`/`io.Reader`) stay plain strings, as in `bytes`.
+- `Bytes`, `Next` and `ReadAllBytes` return three-index slices capped to their
+  length, so appending to one allocates rather than writing into the buffer.
+  This deliberately diverges from `bytes.Buffer`. Anything inside the repo that
+  wants the array's real capacity must use `Cap()`, not `cap(b.Bytes())` —
+  `_bench/retention/main.go` made that mistake and would silently report 0.
+- `makeBuf` allocates with `append([]byte(nil), make([]byte, capacity)...)`,
+  not `make([]byte, length, capacity)`. This is deliberate and must not be
+  "simplified": `make` reports the requested capacity while the allocator has
+  already reserved `roundupsize(capacity)`, so the exact-fit form throws the
+  size-class slack away and the next byte past the requested size forces a full
+  doubling plus a memmove — `Write(1500)` then one more byte settled at `Cap`
+  3000 where `bytes.Buffer` holds at 1536. `bytes.growSlice` uses the same
+  pattern for the same reason.
 
 ## Verification
 

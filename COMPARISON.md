@@ -78,16 +78,55 @@ churn column — ~1 MiB per spike here). bytebufferpool eventually adapts, but
 pins for its entire calibration window and re-pins after each recalibration
 reset. The `sync.Pool` idioms and bpool never evict by size at all.
 
+**Read that bound as per-spike, not steady-state, and not the whole retention
+story.** The measured "≤ 5 per spike" holds because the harness releases each
+buffer without `Reset` and the spikes are rare. Two other shapes behave
+differently, and in one of them bufpool is the *worse* option: a large release
+that is well utilized clears the strike counter, so a large user recurring more
+often than once per five small ones keeps its array resident indefinitely; and
+because reads never reclaim the consumed prefix, a single buffer used as a
+long-lived FIFO grows without bound and then hands that oversized array to the
+pool — see divergence 2 under [Semantics](#semantics). `Reset` at message
+boundaries is what bounds both.
+
 ## Semantics
 
 `bufpool.Buffer` is differentially fuzzed against `bytes.Buffer` (see
 `_bench/fuzz_test.go`): millions of random `Write`/`WriteString`/`WriteByte`/
 `Read`/`ReadByte`/`Next`/`Len`/`Bytes`/`WriteTo`/`Reset` programs execute
-identically on both, so code
-ported from `bytes.Buffer` keeps its behavior for the fuzzed surface. One
-known divergence outside it: a zero-length `Read` on a drained buffer returns
-`(0, io.EOF)` here where `bytes.Buffer` returns `(0, nil)` — both legal under
-`io.Reader`, which leaves the empty-slice case unspecified.
+identically on both, so code ported from `bytes.Buffer` keeps its behavior for
+the fuzzed surface. The fuzzer compares contents, lengths and return values —
+it never calls `Cap`, so capacity and retention behavior is outside what it
+checks even for the operations it drives.
+
+Four known divergences, all outside that surface:
+
+1. **Zero-length `Read` on a drained buffer** returns `(0, io.EOF)` here where
+   `bytes.Buffer` returns `(0, nil)` — both legal under `io.Reader`, which
+   leaves the empty-slice case unspecified.
+2. **Reads never reclaim the consumed prefix.** `bytes.Buffer` compacts on
+   read, so a drain-and-refill loop holds steady; here the buffer grows with
+   the total bytes streamed through it. 1000 × (write 4 KiB, drain) with no
+   `Reset` ends at `Cap` 4194304 against `bytes.Buffer`'s 4096. This is
+   deliberate — it is what makes `Rewind` able to replay everything ever
+   written — and it applies to `WriteTo` as well as `Read`. See
+   [Memory retention](#memory-retention) below for what it means inside a pool,
+   and the "Streaming" section of the README for how to bound it.
+3. **`Reset` applies the eviction heuristic**, where `bytes.Buffer.Reset` only
+   truncates. An oversized, repeatedly under-filled buffer therefore loses its
+   backing array on the fifth consecutive `Reset` — including capacity that an
+   explicit `Grow` reserved, and including on a detached buffer with no pool
+   involved.
+4. **`Bytes`, `Next` and `ReadAllBytes` return slices capped to their length.**
+   `bytes.Buffer` returns slices whose capacity runs to the end of the backing
+   array, so appending to one writes into the buffer — for `Next`, over the
+   bytes not yet read. Here an append allocates instead. This is the one
+   divergence that makes ported code *safer* rather than merely different, but
+   code that deliberately appended into the spare capacity will now allocate.
+
+`ErrTooLarge` mirrors `bytes.ErrTooLarge`: both are exported error values passed
+to `panic` when the buffer cannot grow, so the recover-and-classify idiom ports
+across unchanged.
 
 ## When to use what
 

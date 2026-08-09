@@ -10,27 +10,42 @@ import (
 	"github.com/JohanLindvall/bufpool"
 )
 
+// chunk is the source of written bytes. It is large enough that a single write
+// can be arg*arg bytes for arg up to 255, so a program can push capacity past
+// the 64 KiB threshold where the keep-or-discard heuristic starts counting
+// strikes. With writes capped at 31 bytes, as they once were, Reset's discard
+// branch was unreachable: 69M executions over the accumulated corpus never
+// produced a buffer above 16 KiB.
+var chunk = bytes.Repeat([]byte("0123456789abcdef"), 255*255/16+1)
+
 func FuzzDifferential(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 4, 5})
 	f.Add([]byte{2, 200, 0, 50, 2, 10, 4, 3})
+	// Two large writes (cap doubles past 64 KiB) then six Resets, the shortest
+	// path to the discard branch: the first Reset still sees a full buffer and
+	// clears the strike counter, so five under-utilized ones must follow before
+	// the sixth discards.
+	f.Add([]byte{0, 255, 0, 255, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0, 5, 0})
+	// Recycle through the pool between writes, exercising Get's reuse branch.
+	f.Add([]byte{0, 40, 9, 0, 0, 40, 9, 0, 3, 0})
 	f.Fuzz(func(t *testing.T, program []byte) {
 		var pool bufpool.Pool
 		got := pool.Get()
-		defer got.Release()
+		// Deferred through a closure: op 9 rebinds got.
+		defer func() { got.Release() }()
 		want := new(bytes.Buffer)
 
-		chunk := []byte("0123456789abcdef0123456789abcdef")
 		for i := 0; i+1 < len(program); i += 2 {
-			op, arg := program[i]%9, int(program[i+1])
+			op, arg := program[i]%10, int(program[i+1])
 			switch op {
 			case 0: // Write
-				g, _ := got.Write(chunk[:arg%len(chunk)])
-				w, _ := want.Write(chunk[:arg%len(chunk)])
+				g, _ := got.Write(chunk[:arg*arg])
+				w, _ := want.Write(chunk[:arg*arg])
 				if g != w {
 					t.Fatalf("op %d Write: n=%d want %d", i, g, w)
 				}
 			case 1: // WriteString
-				s := string(chunk[:arg%len(chunk)])
+				s := string(chunk[:arg*arg])
 				g, _ := got.WriteString(s)
 				w, _ := want.WriteString(s)
 				if g != w {
@@ -78,6 +93,16 @@ func FuzzDifferential(f *testing.F) {
 				if !bytes.Equal(g, w) {
 					t.Fatalf("op %d Next(%d): %q want %q", i, arg, g, w)
 				}
+			case 9: // recycle through the pool, exercising Pool.Get's reuse branch
+				// The pool is per-iteration on purpose: hoisting it to package
+				// scope would make iterations order-dependent and violate Go
+				// fuzzing's determinism requirement, so a minimized reproducer
+				// would not reproduce when re-run standalone. A Release
+				// immediately followed by a Get still hits sync.Pool's per-P
+				// private slot, so the array really is recycled.
+				got.Release()
+				got = pool.Get()
+				want.Reset()
 			}
 		}
 		if !bytes.Equal(got.Bytes(), want.Bytes()) || got.Len() != want.Len() {

@@ -13,22 +13,48 @@
 // Reads never reclaim memory: the consumed prefix stays in place so Rewind
 // can replay the full contents, and writes append after it. A buffer used as
 // a long-lived FIFO (write, read, repeat) therefore grows with the total
-// bytes streamed through it, not the working set; bound it by calling Reset
-// at natural message boundaries, or by round-tripping through Release and
-// Get.
+// bytes streamed through it, not the working set. Bound it by calling Reset
+// at natural message boundaries. A Release and Get round trip does not bound
+// it: Get re-slices the same array to zero length, so the round trip resets
+// Size but not Cap.
+//
+// That growth outlives the buffer. A FIFO buffer that grew to N bytes hands
+// an N-byte array to the pool on Release, where it scores as well utilized and
+// is handed on to unrelated callers regardless of how little they asked for,
+// so Reset bounds pool-wide memory rather than just one buffer's.
 //
 // Releasing transfers the backing array back to the pool, so slices obtained
-// through Bytes or ReadAllBytes are invalidated by Release, Close and Reset;
-// conversely, slices handed to NewBuffer or SetBytes are adopted as the
+// through Bytes, Next or ReadAllBytes are invalidated by Release, Close and
+// Reset; conversely, slices handed to NewBuffer or SetBytes are adopted as the
 // buffer's backing array (and follow it into the pool when it is released),
-// so the caller must not use them afterwards.
+// so the caller must not use them afterwards. The returned slices are capped
+// to their length, unlike the equivalents on bytes.Buffer, so appending to one
+// allocates instead of writing into the buffer.
+//
+// Nothing on that path clears an array, so a released buffer's bytes stay
+// readable to whichever unrelated caller receives it next — including through
+// the spare capacity that ReadFrom hands to an io.Reader. Buffer.Wipe zeroes
+// the whole array and is the opt-in for buffers that held secrets.
 //
 // To keep pooled memory bounded, an adaptive strike heuristic decides on each
-// Release or Reset whether a buffer's backing array is worth keeping: arrays
-// of at most 64 KiB, or at least 50% utilized, are always kept; an oversized,
-// under-utilized array survives up to four consecutive strikes before it is
-// discarded. This prevents a single large usage from pinning memory through a
-// continuous stream of small ones.
+// Release or Reset whether a buffer's backing array is worth keeping: buffers
+// whose capacity is at most 64 KiB, or which are at least 50% utilized, are
+// always kept and have their strike counter cleared; an oversized,
+// under-utilized buffer survives up to four consecutive strikes before it is
+// discarded, meaning it is left with no backing array at all rather than a
+// fresh one. This prevents a single large usage from pinning memory through a
+// continuous stream of small ones. Two consequences follow from the details.
+// The budget is spent only by consecutive under-utilized applications, so a
+// large but well-utilized release recurring more often than once per five
+// small ones clears the counter every time and keeps its array resident
+// indefinitely. And each Reset and each Release is one application, so a Reset
+// immediately before a Release charges two strikes for one use.
+//
+// Utilization is measured by capacity, which Go reports per slice rather than
+// per array, and against the written length rather than the unread length.
+// Both matter in practice: adopting a capacity-capped sub-slice of a large
+// array (see SetBytes) hides the array's real size from the heuristic, and
+// capacity reserved by Grow but never filled counts against utilization.
 //
 // Adapted from https://github.com/golang/go/issues/27735#issuecomment-739169121.
 package bufpool

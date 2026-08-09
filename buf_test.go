@@ -117,6 +117,21 @@ func Test_unit_Detach(t *testing.T) {
 	assert.Nil(t, buf.pool)
 }
 
+func Test_unit_Detach_SurvivesClose(t *testing.T) {
+	// The advertised use of Detach: let a buffer's contents outlive a consumer
+	// that closes it. This is also the only state in which Release's guard is
+	// pinned — pool == nil while storage != nil — so without it, swapping the
+	// guard to `b.storage == nil` passes the whole suite at 100% coverage and
+	// panics here on a nil *Pool.
+	p := new(Pool)
+	buf := p.Get()
+	_, _ = buf.WriteString("body")
+	buf.Detach()
+	assert.NoError(t, buf.Close())
+	assert.Equal(t, []byte("body"), buf.Bytes())
+	assert.Equal(t, 0, p.Get().Cap(), "a detached buffer's array must not reach the pool")
+}
+
 func Test_unit_Write(t *testing.T) {
 	p := new(Pool)
 	buf := p.Get()
@@ -319,13 +334,29 @@ func Test_unit_Grow_TooLarge(t *testing.T) {
 	// message, not a generic makeslice runtime error — both when len+n
 	// overflows int and when it merely exceeds the maximum allocation.
 	buf := NewBuffer([]byte("x"))
-	assert.PanicsWithValue(t, "bufpool.Buffer: too large", func() {
+	assert.PanicsWithValue(t, ErrTooLarge, func() {
 		buf.Grow(math.MaxInt) // 1+MaxInt overflows
 	})
 	buf2 := NewBuffer(nil)
-	assert.PanicsWithValue(t, "bufpool.Buffer: too large", func() {
+	assert.PanicsWithValue(t, ErrTooLarge, func() {
 		buf2.Grow(math.MaxInt) // no overflow, but beyond the max slice length
 	})
+	// The panic value must be an error, not a string: the whole point of
+	// exporting it is that recover-and-classify works.
+	assert.EqualError(t, ErrTooLarge, "bufpool.Buffer: too large")
+	assert.PanicsWithError(t, "bufpool.Buffer: too large", func() {
+		NewBuffer(nil).Grow(math.MaxInt)
+	})
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err, _ = r.(error)
+			}
+		}()
+		NewBuffer(nil).Grow(math.MaxInt)
+		return nil
+	}()
+	assert.ErrorIs(t, err, ErrTooLarge)
 }
 
 func Test_unit_Grow_Amortized(t *testing.T) {
@@ -344,6 +375,22 @@ func Test_unit_Grow_Amortized(t *testing.T) {
 	}
 	assert.Equal(t, 100_000, buf.Len())
 	assert.Less(t, reallocs, 20) // ~log2(100000/64) if doubling holds
+}
+
+func Test_unit_Grow_KeepsAllocatorSizeClassSlack(t *testing.T) {
+	// makeBuf allocates through the append-make pattern precisely so the
+	// capacity the allocator actually reserved is usable. Reverting it to
+	// make([]byte, length, capacity) reports the requested size back instead,
+	// and the first byte past it costs a full doubling plus a copy — which is
+	// silent, so pin it. 1500 is not a multiple of 8 and therefore cannot be a
+	// size class, so the rounding up is guaranteed, not incidental.
+	buf := NewBuffer(nil)
+	buf.Grow(1500)
+	assert.Greater(t, buf.Cap(), 1500, "capacity must be rounded up to the allocator's size class")
+	c := buf.Cap()
+	_, _ = buf.Write(make([]byte, 1500))
+	_ = buf.WriteByte('x')
+	assert.Equal(t, c, buf.Cap(), "the rounded-up slack must absorb the next write without reallocating")
 }
 
 func Test_unit_Grow_SufficientCapacity(t *testing.T) {
@@ -515,6 +562,126 @@ func Test_unit_Next(t *testing.T) {
 	assert.Equal(t, []byte("f"), buf.Next(10)) // clamped to the unread remainder
 	assert.Equal(t, 0, len(buf.Next(1)))
 	assert.Equal(t, 0, buf.Len())
+}
+
+func Test_unit_AliasingSlices_CappedToLength(t *testing.T) {
+	// Bytes, Next and ReadAllBytes cap the returned slice at its length, so an
+	// append allocates instead of writing into the buffer. Without the
+	// three-index slice, appending to a Next slice overwrites the unread
+	// remainder in place, and appending to a Bytes slice is silently undone by
+	// the buffer's next write.
+	buf := NewBuffer(nil)
+	buf.Grow(64)
+	_, _ = buf.WriteString("abcdefgh")
+
+	next := buf.Next(3)
+	assert.Equal(t, len(next), cap(next))
+	next = append(next, 'Z')
+	buf.Rewind()
+	assert.Equal(t, "abcdefgh", buf.String(), "append to a Next slice must not reach the buffer")
+
+	_, _ = buf.Read(make([]byte, 3))
+	rest := buf.Bytes()
+	assert.Equal(t, len(rest), cap(rest))
+	rest = append(rest, 'Z')
+	_, _ = buf.WriteString("Q")
+	assert.Equal(t, []byte("defghZ"), rest, "an appended Bytes slice must survive the next write")
+
+	// The source must have spare capacity, or the cap assertion holds trivially.
+	spacious := NewBuffer(make([]byte, 0, 64))
+	_, _ = spacious.WriteString("xyz")
+	all, err := ReadAllBytes(spacious)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("xyz"), all)
+	assert.Equal(t, len(all), cap(all))
+}
+
+func Test_unit_Wipe(t *testing.T) {
+	// Wipe must clear the whole capacity, not just the unread portion: the
+	// consumed prefix and the spare capacity are exactly where a released
+	// buffer's bytes would otherwise stay readable to the pool's next user.
+	buf := NewBuffer(make([]byte, 0, 64))
+	// Fill the array, then truncate, so the spare capacity beyond the current
+	// length holds residue too — clearing only b.buf would leave it behind.
+	_, _ = buf.WriteString(strings.Repeat("S", 64))
+	buf.Reset()
+	_, _ = buf.WriteString("PASSWORD=hunter2")
+	_, _ = buf.Read(make([]byte, 9)) // consume "PASSWORD=" into the prefix
+	array := buf.buf[:cap(buf.buf)]  // the whole backing array, for inspection
+	assert.Contains(t, string(array), "hunter2", "unread bytes")
+	assert.Contains(t, string(array[16:]), "SS", "residue in the spare capacity")
+
+	buf.Wipe()
+
+	assert.Equal(t, 0, buf.Len())
+	assert.Equal(t, 0, buf.Size())
+	assert.Equal(t, 64, buf.Cap(), "a small array is kept, just cleared")
+	assert.Equal(t, make([]byte, 64), array[:64], "every byte of the array must be zero")
+	// Still usable afterwards.
+	_, _ = buf.WriteString("ok")
+	assert.Equal(t, "ok", buf.String())
+}
+
+func Test_unit_Wipe_DoesNotApplyTheHeuristic(t *testing.T) {
+	// Wipe must not charge a strike of its own: the Release or Reset that
+	// follows it is the single application. Wiping through Reset instead would
+	// double-charge, which is exactly what Reset's own godoc warns against —
+	// and for a >64 KiB array that halves the number of cycles it survives.
+	buf := &Buffer{poolStorage: poolStorage{buf: make([]byte, 0, 1<<17)}}
+	for i := 0; i < 10; i++ {
+		buf.Wipe()
+		assert.Equal(t, 0, buf.strikes, "Wipe must not touch the strike counter")
+		assert.NotNil(t, buf.buf, "Wipe must not discard the backing array")
+		assert.Equal(t, 1<<17, buf.Cap())
+	}
+	// The following Reset is what applies the heuristic, once.
+	buf.Reset()
+	assert.Equal(t, 1, buf.strikes)
+}
+
+func Test_unit_Wipe_CostsOneStrikeBeforeRelease(t *testing.T) {
+	// The documented consequence: a fully-written oversized buffer is kept when
+	// released unwiped, and takes one strike when wiped first (never two).
+	for _, wipe := range []bool{false, true} {
+		p := new(Pool)
+		storage := &poolStorage{buf: make([]byte, 0, 1<<17)}
+		p.pool.Put(storage)
+		buf := p.Get()
+		if buf.Cap() != 1<<17 {
+			continue // the pool dropped it; the other leg still covers the path
+		}
+		_, _ = buf.Write(make([]byte, 1<<17))
+		if wipe {
+			buf.Wipe()
+		}
+		buf.Release()
+		want := 0
+		if wipe {
+			want = 1
+		}
+		assert.Equal(t, want, storage.strikes, "wipe=%v", wipe)
+	}
+}
+
+func Test_unit_Wipe_ClearsBeforePoolReuse(t *testing.T) {
+	// The end-to-end reason Wipe exists: without it, ReadFrom hands the next,
+	// unrelated pool user's Reader a scratch slice still holding these bytes.
+	p := new(Pool)
+	for i := 0; i < poolRounds; i++ {
+		buf := p.Get()
+		buf.Grow(4096)
+		_, _ = buf.Write(bytes.Repeat([]byte("PASSWORD=hunter2"), 256)) // dirty the array
+		buf.Wipe()
+		buf.Release()
+		next := p.Get()
+		if next.Cap() != 4096 {
+			continue // the pool dropped it; try again (see poolRounds)
+		}
+		assert.Equal(t, make([]byte, 4096), next.buf[:cap(next.buf)],
+			"a wiped array must carry no residue into the pool")
+		return
+	}
+	t.Fatal("the wiped array never came back out of the pool")
 }
 
 func Test_unit_Next_Negative_Panics(t *testing.T) {

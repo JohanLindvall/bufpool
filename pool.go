@@ -24,14 +24,16 @@ func (p *Pool) Get() *Buffer {
 }
 
 // keep applies the strike heuristic that decides whether b's backing array is
-// worth keeping. Small buffers and sufficiently-utilized ones are always kept (and
-// the strike counter cleared); an oversized, under-utilized buffer is given up to
-// four consecutive strikes before keep reports false (discard), so a single
-// large usage is not kept alive by a continuous stream of small ones. It must be
-// called before the length is truncated, as it reads the current utilization.
+// worth keeping; the package documentation describes the policy and its
+// consequences, and is the copy to keep current. Each call counts as one
+// application, so Reset followed by Release charges two strikes. keep must be
+// called before the length is truncated, as it reads the current utilization,
+// which is measured on the written length rather than the unread length: the
+// most common pooled pattern is fill, drain, release, and scoring that at 0%
+// would strike out every large array every five cycles.
 func (b *poolStorage) keep() bool {
 	switch {
-	case cap(b.buf) <= 1<<16: // always keep buffers smaller than 64KiB
+	case cap(b.buf) <= 1<<16: // always keep buffers of at most 64KiB
 		b.strikes = 0
 	case cap(b.buf)/2 <= len(b.buf): // at least 50% utilization
 		b.strikes = 0

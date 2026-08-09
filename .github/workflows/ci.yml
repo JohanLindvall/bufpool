@@ -9,28 +9,77 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
       # Prebuilt binary (no source compile) + cached binary and lint cache.
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
+
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.21 is the floor declared in go.mod (the `max` builtin is the newest
+        # language feature used); testing it keeps the floor honest rather than
+        # aspirational, since raising it silently taxes every consumer.
+        go: ['1.21', 'stable']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      # The coverage gate is the point: without it -cover only prints a number
+      # and the 100% rule in CLAUDE.md can lapse silently on a green build that
+      # then auto-tags itself as a release.
       - name: Test
-        run: go test -race -shuffle=on -cover ./...
+        run: |
+          set -euo pipefail
+          go test -race -shuffle=on -coverprofile=cover.out ./...
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')
+          awk -v p="$pct" 'BEGIN { if (p + 0 < 100) { printf "coverage %s%% is below the required 100%%\n", p; exit 1 } }'
+          echo "coverage $pct%"
+
+  # Compile-check the comparison harness. It is a separate module under an
+  # underscore directory, so `./...` at the root never descends into it and it
+  # can rot unnoticed — renaming an exported method and updating only the root
+  # module leaves the rest of CI green while every command COMPARISON.md tells
+  # readers to run stops building. Deliberately NOT a dependency of `tag`: it
+  # pulls third-party modules, and a flaky download must not block a release.
+  bench-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - working-directory: _bench
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go build ./...
+          go test -run FuzzDifferential ./... # executes the f.Add seeds; no fuzzing
 
   # On a green main build, bump the patch of the latest vX.Y.Z tag (the Go module
   # version convention). Patch only: a major bump would require a /vN module path,
   # and minor releases are deliberate, so make those by pushing the tag by hand.
   tag:
-    needs: check
+    needs: [lint, check]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Serialize tagging. Without this, two pushes landing inside the CI window
+    # both compute the same next tag: one wins and the other fails the build
+    # under `set -e`, so that commit is never released.
+    concurrency:
+      group: tag-main
+      cancel-in-progress: false
     permissions:
       contents: write # push the new tag
     steps:
@@ -48,6 +97,16 @@ jobs:
             exit 0
           fi
           latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+          # Serializing is not enough: it orders nothing. If the later commit's
+          # job runs first, this job would tag an ancestor with a higher version
+          # than its descendant already carries, and `go get -u` would serve the
+          # older tree. Module versions are immutable once the proxy caches them,
+          # so that is unretractable — skip instead. Also protects the manual
+          # minor-release flow above, which races this job the same way.
+          if [ -n "$latest" ] && ! git merge-base --is-ancestor "$latest" HEAD; then
+            echo "HEAD is not a descendant of $latest; a newer commit is already tagged. Skipping."
+            exit 0
+          fi
           if [ -z "$latest" ]; then
             next='v0.0.1'
           else
