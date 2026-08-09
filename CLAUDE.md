@@ -60,6 +60,11 @@ and only capacity/retention behavior diverges.
 ## Verification
 
 - Tests must keep 100% statement coverage; run `go test -race -shuffle=on -cover ./...`.
+- CI gates on `golangci-lint` as a separate job, so `gofmt`/`go vet`/`go test`
+  passing locally is not enough — run `golangci-lint run ./...` too (it lives in
+  `~/go/bin`, which may not be on `PATH`). A green local suite with an unrun
+  linter is how v0.2.4 was missed: an ineffectual assignment in a new test
+  turned main red and skipped the release.
 - The comparison harness and differential fuzzer live in `_bench/` (its own
   module); run the fuzzer after changing Buffer semantics:
   `cd _bench && go test -fuzz FuzzDifferential -fuzztime 30s .`

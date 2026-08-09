@@ -576,9 +576,10 @@ func Test_unit_AliasingSlices_CappedToLength(t *testing.T) {
 
 	next := buf.Next(3)
 	assert.Equal(t, len(next), cap(next))
-	next = append(next, 'Z')
+	grown := append(next, 'Z')
 	buf.Rewind()
 	assert.Equal(t, "abcdefgh", buf.String(), "append to a Next slice must not reach the buffer")
+	assert.Equal(t, []byte("abcZ"), grown, "the append must land in a fresh array")
 
 	_, _ = buf.Read(make([]byte, 3))
 	rest := buf.Bytes()
