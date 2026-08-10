@@ -73,9 +73,28 @@ var _ interface {
 // reachable through b.storage until the next Release.
 func (b *Buffer) abandon() {
 	b.strikes = 0
+	b.dropStorageRef()
+}
+
+// dropStorageRef clears the pooled storage's stale copy of the slice header
+// so an abandoned array is not kept reachable through b.storage until the
+// next Release. SetBytes calls it directly rather than through abandon: the
+// header clear must stay unconditional even when the strike reset is not, or
+// adopting a smaller foreign array would leave the old array pinned.
+func (b *Buffer) dropStorageRef() {
 	if b.storage != nil {
 		b.storage.buf = nil
 	}
+}
+
+// sameArray reports whether a and p share an uncapped backing array. Slices
+// of one array whose capacities run to the array's end extend to the same
+// final element, so comparing those elements' addresses identifies the array
+// without unsafe. A capacity-capped sub-slice (arena[:n:n]) of the same array
+// compares as different; callers treat "different" as the conservative
+// answer.
+func sameArray(a, p []byte) bool {
+	return cap(a) > 0 && cap(p) > 0 && &a[:cap(a)][cap(a)-1] == &p[:cap(p)][cap(p)-1]
 }
 
 // beforeAppend prepares to append n more bytes: any capacity shortfall is
@@ -111,9 +130,18 @@ func (b *Buffer) Detach() {
 // whole array while the heuristic classifies it by the small capacity, and it
 // is never evicted. Pass a full-capacity slice, or bytes.Clone it, when the
 // underlying array is substantially larger than the contents.
+//
+// Strikes belong to the backing array, so adopting a slice of the current
+// array — as Fill does when the decoder used the scratch space — preserves
+// the array's strike history, while adopting a foreign array resets it. A
+// capacity-capped sub-slice of the current array cannot be told apart from a
+// foreign array and conservatively resets it too.
 func (b *Buffer) SetBytes(p []byte) {
 	b.readPos = 0
-	b.abandon()
+	if !sameArray(b.buf, p) {
+		b.strikes = 0
+	}
+	b.dropStorageRef()
 	b.buf = p
 }
 

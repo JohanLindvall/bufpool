@@ -31,10 +31,19 @@ and only capacity/retention behavior diverges.
 
 - A pool-attached Buffer always carries a non-nil `storage`; `Release` copies
   the handle state back into it. Any path that abandons a backing array
-  (`SetBytes`, `Grow`, reallocation in the write paths via `beforeAppend`,
-  `Reset`'s discard branch) must call `abandon()` — it clears the strike
-  counter *and* the pooled storage's stale slice header so the old array is
-  not pinned until the next `Release`.
+  (`Grow`, reallocation in the write paths via `beforeAppend`, `Reset`'s
+  discard branch) must call `abandon()` — it clears the strike counter *and*
+  the pooled storage's stale slice header so the old array is not pinned until
+  the next `Release`. `SetBytes` is the one exception (changed 2026-08-10,
+  restoring 0.1.0's intent with a correct same-array test): it clears the
+  header unconditionally (`dropStorageRef`) but resets strikes only when the
+  adopted slice is a foreign array (`sameArray`, terminal-address comparison).
+  In-place adoption of the buffer's own array — Fill's no-allocation path —
+  must preserve strike history, or a Fill cycle resets the counter every
+  round trip and an oversized under-utilized array is never evicted
+  (`Test_unit_Fill_DoesNotDefeatEviction`). Keep the header clear
+  unconditional: gating it on the same test re-pins the old array when a
+  smaller foreign array is adopted.
 - `keep()` must run before the length is truncated; utilization is measured
   on the written length.
 - Oversized-allocation panics are unified as the exported `ErrTooLarge` (via

@@ -85,6 +85,39 @@ func Test_unit_SetBytes_ClearsStrikes(t *testing.T) {
 	assert.Equal(t, 0, buf.strikes)
 }
 
+func Test_unit_SetBytes_SameArray_KeepsStrikes(t *testing.T) {
+	// Adopting a slice of the buffer's own array — Fill's in-place path — must
+	// not erase the array's strike history: strikes belong to the array, and
+	// resetting them here let a Fill cycle defeat eviction entirely.
+	buf := &Buffer{poolStorage: poolStorage{buf: make([]byte, 0, 1<<17), strikes: 3}}
+	buf.SetBytes(buf.Scratch()[:100])
+	assert.Equal(t, 3, buf.strikes)
+
+	// A capacity-capped sub-slice of the same array is indistinguishable from
+	// a foreign array without unsafe; the conservative answer is a reset.
+	buf.SetBytes(buf.buf[:50:50])
+	assert.Equal(t, 0, buf.strikes)
+}
+
+func Test_unit_Fill_DoesNotDefeatEviction(t *testing.T) {
+	// Regression: in-place Fill used to reset the strike counter through
+	// SetBytes on every cycle, so an oversized, consistently under-utilized
+	// array cycling through Get/Fill/Release was never evicted. It must go on
+	// the fifth cycle, exactly as on the plain write path.
+	storage := &poolStorage{buf: make([]byte, 1<<20)}
+	for cycle := 1; ; cycle++ {
+		b := &Buffer{poolStorage: *storage, storage: storage, pool: new(Pool)}
+		b.buf = b.buf[:0]
+		_ = b.Fill(func(dst []byte) ([]byte, error) { return dst[:100], nil })
+		*b.storage = b.poolStorage // what Release does before putting back
+		if !storage.keep() {
+			assert.Equal(t, 5, cycle, "oversized under-utilized array must be evicted on the fifth cycle")
+			return
+		}
+		assert.Less(t, cycle, 5, "eviction must not take more than five cycles")
+	}
+}
+
 func Test_unit_Scratch(t *testing.T) {
 	buf := NewBuffer(nil)
 	assert.Empty(t, buf.Scratch()) // no backing array yet
