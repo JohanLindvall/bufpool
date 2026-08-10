@@ -117,12 +117,14 @@ Four known divergences, all outside that surface:
    backing array on the fifth consecutive `Reset` — including capacity that an
    explicit `Grow` reserved, and including on a detached buffer with no pool
    involved.
-4. **`Bytes`, `Next` and `ReadAllBytes` return slices capped to their length.**
+4. **`Next` and `ReadAllBytes` return slices capped to their length.**
    `bytes.Buffer` returns slices whose capacity runs to the end of the backing
-   array, so appending to one writes into the buffer — for `Next`, over the
-   bytes not yet read. Here an append allocates instead. This is the one
-   divergence that makes ported code *safer* rather than merely different, but
-   code that deliberately appended into the spare capacity will now allocate.
+   array, so appending to a `Next` slice there overwrites the bytes not yet
+   read; here the append allocates instead. `Bytes` is *not* capped — it
+   matches `bytes.Buffer.Bytes`, so the hand-spare-capacity-to-an-encoder
+   idiom ports unchanged, and so do its overwrite hazards, compounded here by
+   the pool reusing the array after `Release` (see "Ownership and aliasing" in
+   the README).
 
 `ErrTooLarge` mirrors `bytes.ErrTooLarge`: both are exported error values passed
 to `panic` when the buffer cannot grow, so the recover-and-classify idiom ports

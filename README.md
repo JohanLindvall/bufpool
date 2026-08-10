@@ -171,16 +171,44 @@ to what you will actually write.
 
 The zero-copy calls trade safety for speed; their rules are:
 
-- `Bytes`, `Next` and `ReadAllBytes` return slices that **alias** the buffer.
-  `Release`, `Close` and `Reset` invalidate them — the backing array re-enters
-  the pool and the next `Get` may overwrite it. Copy the bytes (or use
-  `String`) if they must outlive the buffer.
-- Those slices are capped to their length (a three-index slice), so
-  **appending** to one allocates a fresh array rather than writing into the
-  buffer. This diverges from `bytes.Buffer`, whose `Bytes` and `Next` slices
-  carry capacity out to the end of the backing array — there, appending to a
-  `Next` slice silently overwrites the bytes not yet read. Reading through them
-  still aliases the buffer, so the lifetime rule above continues to apply.
+- `Bytes`, `Next`, `ReadAllBytes` and `Scratch` return slices that **alias**
+  the buffer. `Release`, `Close` and `Reset` invalidate them — the backing
+  array re-enters the pool and the next `Get` may overwrite it. Copy the bytes
+  (or use `String`) if they must outlive the buffer.
+- The `Next` and `ReadAllBytes` slices are capped to their length (a
+  three-index slice), so **appending** to one allocates a fresh array rather
+  than writing into the buffer. This diverges from `bytes.Buffer`, where
+  appending to a `Next` slice silently overwrites the bytes not yet read.
+- The `Bytes` slice is **not** capped: as with `bytes.Buffer.Bytes`, its
+  capacity runs to the end of the backing array, so appending to it fills the
+  buffer's spare capacity without allocating. This exists for one idiom —
+  handing the slack to an appending encoder and adopting the result
+  (`p := enc.MarshalAppend(buf.Bytes(), msg)`). It also makes the slice a
+  writable window onto the buffer: **do not modify the buffer through it** in
+  any other pattern. Appended bytes lie beyond the buffer's length — the
+  buffer's own next write lands directly over them, and `Release` hands the
+  array, appended bytes included, to an unrelated caller. Finish with (or
+  copy) the result before writing to, releasing or resetting the buffer.
+- `Scratch` is the destination-slice counterpart of the `Bytes` append idiom:
+  it returns the spare capacity as a **full-length** slice, sized for APIs
+  that fill a caller-provided `dst` when `len(dst)` suffices and allocate
+  otherwise. `Fill` wraps the whole sequence — scratch, decode, adopt — in
+  one call, and its closure keeps every aliasing slice out of the caller's
+  scope:
+
+  ```go
+  buf := pool.Get()
+  err := buf.Fill(func(dst []byte) ([]byte, error) {
+      return snappy.Decode(dst, packed)
+  })
+  ```
+
+  Either way the decode goes, the buffer ends up owning the result: in place
+  with no allocation when the scratch space sufficed, or adopting the
+  decoder's fresh exact-size array — which warms the pool for the next round
+  trip. Use it on an empty buffer (adoption discards existing contents), and
+  note that on a pooled buffer the scratch space initially holds a previous
+  user's bytes (see [Secrets](#secrets)).
 - `NewBuffer` and `SetBytes` **adopt** the given slice as the backing array
   without copying. Ownership transfers to the buffer (and, once released, to
   the pool): the caller must not use the slice afterwards. Because the pool
@@ -293,6 +321,8 @@ is the authoritative description of the policy.
 | `(*Buffer) Wipe()` | Zero the whole backing array, then reset. |
 | `ErrTooLarge` | Panic value when a buffer cannot grow further. |
 | `(*Buffer) SetBytes(p []byte)` | Replace contents, adopting `p` (no copy), and rewind. |
+| `(*Buffer) Scratch() []byte` | Spare capacity as a full-length slice (aliasing) — the `dst` for decode-into APIs. |
+| `(*Buffer) Fill(fn func([]byte) ([]byte, error)) error` | Decode into `Scratch`, adopt the result, return `fn`'s error. |
 | `(*Buffer) Release() / Close() error` | Release into the pool. |
 | `(*Buffer) Detach()` | Detach from the pool; Release/Close become no-ops. |
 | `ReadAllBytes(r io.Reader) ([]byte, error)` | Read all bytes, zero-copy for `*Buffer`. |

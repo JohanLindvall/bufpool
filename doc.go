@@ -24,16 +24,25 @@
 // so Reset bounds pool-wide memory rather than just one buffer's.
 //
 // Releasing transfers the backing array back to the pool, so slices obtained
-// through Bytes, Next or ReadAllBytes are invalidated by Release, Close and
-// Reset; conversely, slices handed to NewBuffer or SetBytes are adopted as the
-// buffer's backing array (and follow it into the pool when it is released),
-// so the caller must not use them afterwards. The returned slices are capped
-// to their length, unlike the equivalents on bytes.Buffer, so appending to one
-// allocates instead of writing into the buffer.
+// through Bytes, Next, ReadAllBytes or Scratch are invalidated by Release,
+// Close and Reset; conversely, slices handed to NewBuffer or SetBytes are
+// adopted as the buffer's backing array (and follow it into the pool when it
+// is released), so the caller must not use them afterwards. Scratch exposes
+// the spare capacity as a full-length slice for APIs that decode into a
+// caller-provided destination, and Fill wraps the whole idiom — scratch,
+// decode, adopt — in one call whose closure keeps every aliasing slice out of
+// the caller's scope (see Scratch and Fill). Slices returned by Next and
+// ReadAllBytes are capped to their length, unlike the equivalents on
+// bytes.Buffer, so appending to one allocates instead of overwriting the
+// bytes that follow. Bytes is not capped: as on bytes.Buffer, its slice
+// carries the array's spare capacity so an appending encoder can fill the
+// buffer's slack — but that makes it a writable window onto the buffer, and
+// the buffer must not otherwise be modified through it (see Bytes).
 //
 // Nothing on that path clears an array, so a released buffer's bytes stay
 // readable to whichever unrelated caller receives it next — including through
-// the spare capacity that ReadFrom hands to an io.Reader. Buffer.Wipe zeroes
+// the spare capacity that Scratch exposes and ReadFrom hands to an io.Reader.
+// Buffer.Wipe zeroes
 // the whole array and is the opt-in for buffers that held secrets.
 //
 // To keep pooled memory bounded, an adaptive strike heuristic decides on each

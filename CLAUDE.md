@@ -43,11 +43,27 @@ and only capacity/retention behavior diverges.
   exporting it, and `buf_test.go` asserts `recover()` yields something
   `errors.Is`-comparable. The programmer-error panics (negative counts,
   contract-violating `io.Writer`/`io.Reader`) stay plain strings, as in `bytes`.
-- `Bytes`, `Next` and `ReadAllBytes` return three-index slices capped to their
-  length, so appending to one allocates rather than writing into the buffer.
-  This deliberately diverges from `bytes.Buffer`. Anything inside the repo that
-  wants the array's real capacity must use `Cap()`, not `cap(b.Bytes())` —
-  `_bench/retention/main.go` made that mistake and would silently report 0.
+- `Next` and `ReadAllBytes` return three-index slices capped to their length,
+  so appending to one allocates rather than writing into the buffer. `Bytes`
+  is deliberately *not* capped (decided 2026-08-10, reverting the 0.2.4
+  capping): like `bytes.Buffer.Bytes`, its capacity runs to the end of the
+  backing array so downstream code can hand the pool's spare capacity to an
+  appending encoder and adopt the result. The trade-off is documented, not
+  fixed in code: the `Bytes` doc comment, README ("Ownership and aliasing")
+  and COMPARISON.md §4 all warn that the slice is a writable window onto the
+  buffer and must not be used to modify it outside that idiom — keep those
+  warnings in sync if `Bytes` is touched, and do not re-cap it. Anything
+  inside the repo that wants the array's real capacity must still use `Cap()`,
+  not `cap(b.Bytes())` — the latter is offset by the read position.
+- `Scratch` (added 2026-08-10) returns `buf[len:cap]` at *full length*, not
+  length 0: decode-into-dst APIs (`snappy.Decode` and kin) test `len(dst)`,
+  not `cap(dst)`, so an `AvailableBuffer`-style empty slice would silently
+  never reuse pooled capacity. `Fill` wraps scratch → decode → adopt around a
+  caller closure; the closure shape was chosen over an `Adopt(p, err)`
+  passthrough (considered same day) precisely so no variable aliasing the
+  scratch or adopted slice can survive in caller scope. Fill must stay a
+  trivial three-liner — no Release-on-error or other hidden control flow —
+  and must adopt fn's result even on error.
 - `makeBuf` allocates with `append([]byte(nil), make([]byte, capacity)...)`,
   not `make([]byte, length, capacity)`. This is deliberate and must not be
   "simplified": `make` reports the requested capacity while the allocator has

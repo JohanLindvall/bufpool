@@ -117,17 +117,80 @@ func (b *Buffer) SetBytes(p []byte) {
 	b.buf = p
 }
 
+// Fill passes the buffer's spare capacity (Scratch) to fn, adopts the slice
+// fn returns as the buffer's new contents (SetBytes), and returns fn's error
+// unchanged. It packages the decode-into-dst idiom in one call:
+//
+//	buf := pool.Get()
+//	err := buf.Fill(func(dst []byte) ([]byte, error) {
+//		return snappy.Decode(dst, packed)
+//	})
+//
+// fn should treat dst as scratch space of arbitrary length and content: use
+// it when it is large enough, allocate otherwise, and return the slice
+// holding the result — the contract of snappy.Decode and kin. Either way the
+// buffer ends up owning the result: in place with no allocation when dst
+// sufficed, or adopting fn's fresh exact-size array, which warms the pool for
+// the next round trip. Call Grow first to guarantee the in-place path.
+//
+// Neither dst nor the returned slice may be retained or used once fn returns
+// — both alias the buffer's backing array; keeping everything inside fn is
+// the point of Fill over calling Scratch and SetBytes directly. The result is
+// adopted even when fn returns an error (decoders return a nil or partial
+// result alongside their error, leaving the buffer empty or holding the
+// partial result), so release or reset the buffer on error as usual. Use Fill
+// on an empty buffer: adoption discards existing contents.
+func (b *Buffer) Fill(fn func(scratch []byte) ([]byte, error)) error {
+	p, err := fn(b.Scratch())
+	b.SetBytes(p)
+	return err
+}
+
+// Scratch returns the buffer's spare capacity — the region from its length to
+// its capacity — as a full-length slice. It is the destination-slice
+// counterpart of the Bytes append idiom: pass it as the dst of an API that
+// fills a caller-provided slice when it is long enough and otherwise
+// allocates, such as snappy.Decode, then adopt the result with SetBytes —
+// or use Fill, which wraps the whole sequence. Such APIs test len(dst),
+// not cap(dst) — which is why Scratch has full length, where a fresh pooled
+// buffer's Bytes is empty. Both outcomes of the decode adopt correctly: an
+// in-place result re-slices the buffer's own array with no allocation, and a
+// fresh exact-size array replaces it and warms the pool for the next round
+// trip. Call Grow first to guarantee the in-place path.
+//
+// Scratch is not a write path: bytes written into the slice are invisible to
+// the buffer — its length does not change — until the result is adopted. Use
+// it on an empty buffer: adoption discards existing contents, and adopting an
+// in-place result on a partly-written buffer strands the written prefix in
+// the array. The slice aliases the backing array, so it is only valid until
+// the next mutating call, and on a buffer from a pool it initially holds
+// bytes left by a previous, unrelated user of the pool (Wipe clears an array
+// before it re-enters the pool).
+func (b *Buffer) Scratch() []byte {
+	return b.buf[len(b.buf):cap(b.buf)]
+}
+
 // Bytes returns the unread portion of the buffer. The slice aliases the
 // buffer's backing array and is only valid until the next mutating call;
 // Release, Close and Reset invalidate it. Copy the bytes (or use String) if
 // they must outlive the buffer.
 //
-// The returned slice's capacity is limited to its length, unlike
-// bytes.Buffer.Bytes, so appending to it allocates a fresh array instead of
-// writing into the buffer's spare capacity. Reads through it still alias the
-// buffer, so the lifetime rule above continues to apply.
+// Like bytes.Buffer.Bytes, the slice's capacity runs to the end of the
+// backing array, so appending to it writes into the buffer's spare capacity
+// without allocating. That exists for one idiom — hand the spare capacity to
+// an appending encoder and adopt the result:
+//
+//	p := enc.MarshalAppend(buf.Bytes(), msg) // fills the buffer's slack
+//
+// It also makes the slice a writable window onto the buffer itself, so do not
+// modify the buffer through it in any other pattern. Appended bytes lie beyond
+// the buffer's length: the buffer neither sees nor preserves them, its next
+// write lands directly over them, and Release hands the array — appended bytes
+// included — to whichever unrelated caller gets it from the pool next. Finish
+// with, or copy, an appended result before writing to, releasing or resetting
+// the buffer. Next and ReadAllBytes still cap their slices to their length.
 func (b *Buffer) Bytes() []byte {
-	return b.buf[b.readPos:len(b.buf):len(b.buf)]
+	return b.buf[b.readPos:]
 }
 
 // String returns a copy of the unread portion of the buffer as a string,
@@ -140,8 +203,8 @@ func (b *Buffer) String() string {
 }
 
 // Release returns the buffer to its pool and resets it to the zero value.
-// Releasing invalidates all slices previously returned by Bytes, Next or
-// ReadAllBytes: the backing array re-enters the pool and the next Get may
+// Releasing invalidates all slices previously returned by Bytes, Next,
+// ReadAllBytes or Scratch: the backing array re-enters the pool and the next Get may
 // overwrite it, so copy such slices first if they must outlive the buffer.
 // After Release the buffer is a detached zero buffer — further calls operate
 // on that empty buffer instead of panicking, but are programming errors. If
@@ -240,8 +303,8 @@ func makeBuf(length, capacity int) (buf []byte) {
 //
 // Handing a buffer to a consumer that closes it transfers release timing to
 // that consumer, possibly on another goroutine: the caller's own Release
-// becomes a no-op, and no slice from Bytes, Next or ReadAllBytes may be held
-// across the call. net/http is the common case and needs care. Because
+// becomes a no-op, and no slice from Bytes, Next, ReadAllBytes or Scratch may
+// be held across the call. net/http is the common case and needs care. Because
 // *Buffer already satisfies io.ReadCloser, http.NewRequest adopts it as
 // req.Body verbatim rather than wrapping it, and the transport closes it
 // before Do returns; and because the type switch there special-cases only
@@ -286,7 +349,7 @@ func (b *Buffer) ReadByte() (byte, error) {
 // Like Bytes, the slice aliases the buffer's backing array and is only valid
 // until the next mutating call. Next panics if n is negative.
 //
-// As with Bytes, the returned slice's capacity is limited to its length, so
+// Unlike Bytes, the returned slice's capacity is limited to its length, so
 // appending to it allocates rather than overwriting the bytes that follow —
 // which, for Next, would be the unread remainder.
 func (b *Buffer) Next(n int) []byte {
@@ -394,7 +457,8 @@ func (b *Buffer) Rewind() {
 // buffer) instead of kept, so a single large use does not pin memory across
 // resets. Unlike Release, the buffer stays usable and attached to its pool.
 //
-// Reset invalidates slices previously returned by Bytes, Next or ReadAllBytes.
+// Reset invalidates slices previously returned by Bytes, Next, ReadAllBytes
+// or Scratch.
 // It also counts as one application of the heuristic, as Release does, so a
 // Reset immediately before a Release charges the array two strikes for one
 // use; that is redundant, since Release resets the handle anyway.

@@ -85,6 +85,44 @@ func Test_unit_SetBytes_ClearsStrikes(t *testing.T) {
 	assert.Equal(t, 0, buf.strikes)
 }
 
+func Test_unit_Scratch(t *testing.T) {
+	buf := NewBuffer(nil)
+	assert.Empty(t, buf.Scratch()) // no backing array yet
+
+	buf.Grow(64)
+	_, _ = buf.WriteString("abc")
+	s := buf.Scratch()
+	assert.Equal(t, buf.Cap()-buf.Size(), len(s))
+	assert.True(t, &s[0] == &buf.buf[:cap(buf.buf)][len(buf.buf)], "Scratch must start at the buffer's length")
+}
+
+func Test_unit_Fill_InPlaceScratchResult(t *testing.T) {
+	// The decode-into-dst idiom's in-place path: the "decoder" filled the
+	// scratch space, so adoption re-slices the pooled array, no allocation.
+	buf := pooledBuffer(64)
+	var seen []byte
+	err := buf.Fill(func(dst []byte) ([]byte, error) {
+		seen = dst
+		n := copy(dst, "unpacked")
+		return dst[:n], nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 64, len(seen), "fn must receive the full-length spare capacity")
+	assert.Equal(t, "unpacked", buf.String())
+	assert.True(t, &buf.buf[0] == &seen[0], "in-place adoption must keep the pooled array")
+	assert.NotPanics(t, buf.Release)
+}
+
+func Test_unit_Fill_ErrorPassthrough(t *testing.T) {
+	// The result is adopted even alongside an error, and the error returned
+	// unchanged — mirroring decoders that return a nil result with their error.
+	buf := NewBuffer([]byte("old contents"))
+	errIn := errors.New("decode failed")
+	err := buf.Fill(func([]byte) ([]byte, error) { return nil, errIn })
+	assert.Equal(t, errIn, err)
+	assert.Equal(t, 0, buf.Size(), "the nil result must replace the old contents")
+}
+
 func Test_unit_Bytes(t *testing.T) {
 	buf := &Buffer{poolStorage: poolStorage{buf: []byte("test")}}
 	assert.Equal(t, []byte("test"), buf.Bytes())
@@ -564,12 +602,11 @@ func Test_unit_Next(t *testing.T) {
 	assert.Equal(t, 0, buf.Len())
 }
 
-func Test_unit_AliasingSlices_CappedToLength(t *testing.T) {
-	// Bytes, Next and ReadAllBytes cap the returned slice at its length, so an
-	// append allocates instead of writing into the buffer. Without the
-	// three-index slice, appending to a Next slice overwrites the unread
-	// remainder in place, and appending to a Bytes slice is silently undone by
-	// the buffer's next write.
+func Test_unit_AliasingSlices_NextAndReadAllCapped_BytesNot(t *testing.T) {
+	// Next and ReadAllBytes cap the returned slice at its length, so an append
+	// allocates instead of overwriting the unread remainder in place. Bytes is
+	// deliberately NOT capped: its capacity runs to the end of the backing
+	// array so an appending encoder can fill the buffer's spare capacity.
 	buf := NewBuffer(nil)
 	buf.Grow(64)
 	_, _ = buf.WriteString("abcdefgh")
@@ -583,10 +620,14 @@ func Test_unit_AliasingSlices_CappedToLength(t *testing.T) {
 
 	_, _ = buf.Read(make([]byte, 3))
 	rest := buf.Bytes()
-	assert.Equal(t, len(rest), cap(rest))
-	rest = append(rest, 'Z')
+	assert.Greater(t, cap(rest), len(rest), "Bytes must carry the array's spare capacity")
+	appended := append(rest, 'Z')
+	assert.Equal(t, "defghZ", string(appended))
+	assert.True(t, &appended[0] == &rest[0], "an append within the spare capacity must land in the buffer's array, not a fresh one")
+	// The documented hazard: appended bytes lie beyond the buffer's length, so
+	// its own next write lands directly over them.
 	_, _ = buf.WriteString("Q")
-	assert.Equal(t, []byte("defghZ"), rest, "an appended Bytes slice must survive the next write")
+	assert.Equal(t, []byte("defghQ"), appended, "the buffer's next write overwrites bytes appended through a Bytes slice")
 
 	// The source must have spare capacity, or the cap assertion holds trivially.
 	spacious := NewBuffer(make([]byte, 0, 64))
