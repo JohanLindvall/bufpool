@@ -191,8 +191,9 @@ The zero-copy calls trade safety for speed; their rules are:
   copy) the result before writing to, releasing or resetting the buffer.
 - `Scratch` is the destination-slice counterpart of the `Bytes` append idiom:
   it returns the spare capacity as a **full-length** slice, sized for APIs
-  that fill a caller-provided `dst` when `len(dst)` suffices and allocate
-  otherwise. `Fill` wraps the whole sequence — scratch, decode, adopt — in
+  that fill a caller-provided `dst` when it is big enough and allocate
+  otherwise — some key that decision on `len(dst)` (golang/snappy), some on
+  `cap(dst)` (klauspost's s2); the full-length slice satisfies both. `Fill` wraps the whole sequence — scratch, decode, adopt — in
   one call, and its closure keeps every aliasing slice out of the caller's
   scope:
 

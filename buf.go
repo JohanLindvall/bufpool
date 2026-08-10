@@ -179,9 +179,11 @@ func (b *Buffer) Fill(fn func(scratch []byte) ([]byte, error)) error {
 // counterpart of the Bytes append idiom: pass it as the dst of an API that
 // fills a caller-provided slice when it is long enough and otherwise
 // allocates, such as snappy.Decode, then adopt the result with SetBytes —
-// or use Fill, which wraps the whole sequence. Such APIs test len(dst),
-// not cap(dst) — which is why Scratch has full length, where a fresh pooled
-// buffer's Bytes is empty. Both outcomes of the decode adopt correctly: an
+// or use Fill, which wraps the whole sequence. Such APIs key the reuse
+// decision on len(dst) (github.com/golang/snappy) or on cap(dst)
+// (klauspost/compress's s2); the full-length slice satisfies both, where a
+// fresh pooled buffer's Bytes — empty, however large its capacity — is
+// silently ignored by the len-based ones. Both outcomes of the decode adopt correctly: an
 // in-place result re-slices the buffer's own array with no allocation, and a
 // fresh exact-size array replaces it and warms the pool for the next round
 // trip. Call Grow first to guarantee the in-place path.

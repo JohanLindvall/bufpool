@@ -65,9 +65,11 @@ and only capacity/retention behavior diverges.
   inside the repo that wants the array's real capacity must still use `Cap()`,
   not `cap(b.Bytes())` — the latter is offset by the read position.
 - `Scratch` (added 2026-08-10) returns `buf[len:cap]` at *full length*, not
-  length 0: decode-into-dst APIs (`snappy.Decode` and kin) test `len(dst)`,
-  not `cap(dst)`, so an `AvailableBuffer`-style empty slice would silently
-  never reuse pooled capacity. `Fill` wraps scratch → decode → adopt around a
+  length 0: decode-into-dst APIs key reuse on `len(dst)` (golang/snappy
+  decode.go:62) or `cap(dst)` (klauspost/compress s2/decode.go:63, which its
+  snappy wrapper delegates to); full length satisfies both, while an
+  `AvailableBuffer`-style empty slice silently never reuses pooled capacity
+  with the len-based ones. `Fill` wraps scratch → decode → adopt around a
   caller closure; the closure shape was chosen over an `Adopt(p, err)`
   passthrough (considered same day) precisely so no variable aliasing the
   scratch or adopted slice can survive in caller scope. Fill must stay a
