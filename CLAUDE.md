@@ -120,4 +120,6 @@ and only capacity/retention behavior diverges.
   module); run the fuzzer after changing Buffer semantics:
   `cd _bench && go test -fuzz FuzzDifferential -fuzztime 30s .`
 - CI auto-tags every green main commit as the next patch version — pushing to
-  main is releasing.
+  main is releasing — and publishes a GitHub release for the tag, with the
+  subjects of the commits since the previous tag as notes, so write commit
+  subjects that read well in release notes.
