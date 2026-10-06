@@ -111,6 +111,11 @@ and only capacity/retention behavior diverges.
   `~/go/bin`, which may not be on `PATH`). A green local suite with an unrun
   linter is how v0.2.4 was missed: an ineffectual assignment in a new test
   turned main red and skipped the release.
+- CI pins the golangci-lint version but lints on Go `stable`, so a new Go
+  minor can turn main red with no code change: v2.12.2 (built with go1.26)
+  failed every commit once stable became go1.27, until the pin moved to
+  v2.14.0 (2026-10-06). Bump the pin with the Go release, and keep the
+  `~/go/bin` binary at the pinned version so local lint matches CI.
 - The comparison harness and differential fuzzer live in `_bench/` (its own
   module); run the fuzzer after changing Buffer semantics:
   `cd _bench && go test -fuzz FuzzDifferential -fuzztime 30s .`

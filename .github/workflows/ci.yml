@@ -17,10 +17,14 @@ jobs:
         with:
           go-version: stable
       # Prebuilt binary (no source compile) + cached binary and lint cache.
+      # The binary must be built with a Go at least as new as `stable` above:
+      # once stable became go1.27, v2.12.2 (built with go1.26) failed every
+      # commit with type-check errors in the standard library. Bump this pin
+      # when a new Go minor ships.
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          version: v2.14.0
 
   check:
     runs-on: ubuntu-latest
