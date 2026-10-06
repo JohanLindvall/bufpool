@@ -1,19 +1,35 @@
 # bufpool
 
-A small Go package for pooling and reusing byte buffers, reducing allocations
-and garbage-collector pressure in code that handles many short-lived buffers.
+[![CI](https://github.com/JohanLindvall/bufpool/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/JohanLindvall/bufpool/actions/workflows/ci.yml?query=branch%3Amain)
+[![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/bufpool.svg)](https://pkg.go.dev/github.com/JohanLindvall/bufpool)
+[![Version](https://img.shields.io/github/v/tag/JohanLindvall/bufpool?sort=semver&label=version)](https://github.com/JohanLindvall/bufpool/tags)
+[![Go version](https://img.shields.io/github/go-mod/go-version/JohanLindvall/bufpool)](go.mod)
+[![License](https://img.shields.io/github/license/JohanLindvall/bufpool)](LICENSE)
 
-A `Buffer` implements `io.Reader`, `io.ByteReader`, `io.Writer`,
-`io.ByteWriter`, `io.StringWriter`, `io.ReaderFrom`, `io.WriterTo`,
-`io.Closer` and `fmt.Stringer`, so it drops into most code that already
-speaks the standard streaming interfaces. Buffers
-obtained from a `Pool` are returned to it for reuse, and an adaptive *strike*
-heuristic discards backing arrays that have grown large but are repeatedly
-under-utilized, so a single large write does not pin memory indefinitely. See
-[COMPARISON.md](COMPARISON.md) for how this stacks up against `sync.Pool`
-idioms and other buffer pools.
+**bufpool** is a byte-buffer pool for Go that does not let one large request
+pin memory. After a 1 MiB spike, a plain `sync.Pool` keeps handing that array
+to 99% of the 1 KiB requests that follow; bufpool's strike heuristic evicts it
+after five under-used cycles, 0.5% of them
+([retention benchmark](COMPARISON.md#memory-retention)). Its buffers match
+`bytes.Buffer`'s read/write behavior
+([differentially fuzzed](COMPARISON.md#semantics), divergences documented),
+return to the pool on `Close` so they can be
+[handed off as an `io.ReadCloser`](https://pkg.go.dev/github.com/JohanLindvall/bufpool#example-package-ReadCloser),
+and cost one 64-byte allocation per `Get`/`Release` cycle.
 
-Adapted from <https://github.com/golang/go/issues/27735#issuecomment-739169121>.
+```go
+var pool bufpool.Pool // the zero value is ready to use
+
+buf := pool.Get()
+defer buf.Release() // back to the pool; buf and slices from it are invalid after this
+
+fmt.Fprintf(buf, "hello, %s", "gopher") // a Buffer is an io.Writer…
+io.Copy(os.Stdout, buf)                 // …and an io.Reader
+```
+
+[Run it on pkg.go.dev](https://pkg.go.dev/github.com/JohanLindvall/bufpool#example-package) ·
+[API reference](https://pkg.go.dev/github.com/JohanLindvall/bufpool) ·
+[Benchmarks and alternatives](COMPARISON.md)
 
 ## Install
 
@@ -86,6 +102,11 @@ followed; without one the client returns the 307/308 response rather than
 following it.
 
 ## Usage
+
+A `Buffer` implements `io.Reader`, `io.ByteReader`, `io.Writer`,
+`io.ByteWriter`, `io.StringWriter`, `io.ReaderFrom`, `io.WriterTo`,
+`io.Closer` and `fmt.Stringer`, so it drops into most code that already
+speaks the standard streaming interfaces.
 
 ### Pooling
 
@@ -349,4 +370,5 @@ including the memory-retention behavior the strike heuristic exists for — see
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Adapted from
+<https://github.com/golang/go/issues/27735#issuecomment-739169121>.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Memory-retention probe: how long does a pool keep handing out an oversized
 // backing array after a rare large request, and how much allocation churn does
 // its eviction policy cost?

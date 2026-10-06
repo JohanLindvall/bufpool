@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it using the metadata from this file.
+type: software
+title: bufpool
+abstract: >-
+  A byte-buffer pool for Go whose buffers match bytes.Buffer's read/write
+  behavior and return to the pool on Close, and whose strike heuristic evicts
+  oversized, under-used backing arrays so that one large request does not pin
+  memory for the small ones after it.
+authors:
+  - given-names: Johan
+    family-names: Lindvall
+repository-code: "https://github.com/JohanLindvall/bufpool"
+url: "https://pkg.go.dev/github.com/JohanLindvall/bufpool"
+license: MIT
+keywords:
+  - go
+  - golang
+  - buffer pool
+  - memory management
+  - garbage collection

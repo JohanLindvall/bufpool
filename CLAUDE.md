@@ -84,6 +84,25 @@ and only capacity/retention behavior diverges.
   3000 where `bytes.Buffer` holds at 1536. `bytes.growSlice` uses the same
   pattern for the same reason.
 
+## Docs and repo metadata (discoverability pass, 2026-10-06)
+
+- Every `.go` file starts with `// SPDX-License-Identifier: MIT` and a blank
+  line. The blank line matters: without it the SPDX line joins the package
+  doc comment (doc.go, `_bench/fuzz_test.go`, `_bench/retention/main.go`).
+- The README's first screen (badges, pitch, code sample, run link) carries
+  copied facts: 99% / 0.5% from COMPARISON.md's retention table, and 64 B /
+  1 alloc from `BenchmarkGetRelease`. Re-measure and update both places
+  together. The sample mirrors `Example` in `example_test.go`, and the README
+  links pkg.go.dev's `#example-package` and `#example-package-ReadCloser`
+  anchors, so renaming either example breaks those links.
+- doc.go's first sentence is the synopsis pkg.go.dev search shows; keep it a
+  specific claim rather than a generic "pools byte buffers".
+- CITATION.cff deliberately omits `version` and `date-released`: CI tags every
+  green main commit, so a pinned version would be stale after the next push.
+- SECURITY.md routes reports through GitHub private vulnerability reporting
+  (must be enabled in repo settings) and states that bufpool uses neither
+  `unsafe` nor cgo — keep that true or update it.
+
 ## Verification
 
 - Tests must keep 100% statement coverage; run `go test -race -shuffle=on -cover ./...`.

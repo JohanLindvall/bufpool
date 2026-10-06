@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Differential fuzz: bufpool.Buffer against bytes.Buffer for the operations
 // whose semantics the package documents as matching (Write, WriteString,
 // WriteByte, Read, ReadByte, Next, Len, Bytes, WriteTo, Reset).

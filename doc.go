@@ -1,6 +1,9 @@
-// Package bufpool provides pooled, reusable byte buffers that reduce
-// allocations and garbage-collector pressure in code handling many
-// short-lived buffers.
+// SPDX-License-Identifier: MIT
+
+// Package bufpool pools bytes.Buffer-like byte buffers, evicting oversized,
+// under-used backing arrays so that one large request does not pin memory for
+// the small ones after it. Pooling cuts allocations and garbage-collector
+// pressure in code that handles many short-lived buffers.
 //
 // A Buffer implements io.Reader, io.ByteReader, io.Writer, io.ByteWriter,
 // io.StringWriter, io.ReaderFrom, io.WriterTo, io.Closer and fmt.Stringer.

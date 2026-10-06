@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Speed comparison: bufpool vs common alternatives.
 //
 // Implementations compared:
